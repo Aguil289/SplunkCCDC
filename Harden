@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# harden-oracle9-splunk.sh
+# Hardening script for Oracle Linux 9 running Splunk
+# Run as root. Test on staging first.
+set -euo pipefail
+IFS=$'\n\t'
+
+##### CONFIGURE THESE BEFORE RUNNING #####
+SPLUNK_HOME="/opt/splunk"          # adjust if Splunk is installed elsewhere
+SPLUNK_USER="splunk"               # account Splunk should run as
+SPLUNK_GROUP="splunk"
+SPLUNK_WEB_PORTS=(8000)            # add other Splunk web ports if used
+SPLUNK_MGMT_PORTS=(8089)           # add Splunk management port if used
+ADMIN_NETS=()                       # list of admin CIDRs to allow (e.g. ("192.168.1.0/24" "10.0.0.0/8"))
+# If ADMIN_NETS empty, only localhost will be allowed to Splunk ports.
+#########################################
+
+echo "Starting OS hardening for Splunk host on Oracle Linux 9"
+echo "SPLUNK_HOME=${SPLUNK_HOME} SPLUNK_USER=${SPLUNK_USER} ADMIN_NETS=${ADMIN_NETS[*]}"
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: must run as root" >&2
+  exit 2
+fi
+
+# small helper for idempotence
+systemctl_is_active() { systemctl is-active --quiet "$1"; }
+
+# Enable a systemd unit if it's installed, logging a note otherwise.
+enable_unit_if_available() {
+  local unit_name="$1"
+  if systemctl cat "${unit_name}" >/dev/null 2>&1; then
+    systemctl enable --now "${unit_name}" || echo "WARNING: Unable to enable/start ${unit_name}."
+  else
+    echo "NOTE: ${unit_name} not found on this host; skipping enable."
+  fi
+}
+
+# 1) Ensure user/group exist
+if ! id "${SPLUNK_USER}" >/dev/null 2>&1; then
+  echo "Creating user ${SPLUNK_USER}"
+  useradd --system --home-dir "${SPLUNK_HOME}" --shell /sbin/nologin "${SPLUNK_USER}"
+else
+  echo "User ${SPLUNK_USER} exists"
+fi
+
+# create group if missing
+if ! getent group "${SPLUNK_GROUP}" >/dev/null 2>&1; then
+  groupadd --system "${SPLUNK_GROUP}"
+fi
+usermod -a -G "${SPLUNK_GROUP}" "${SPLUNK_USER}" >/dev/null 2>&1 || true
+
+# 2) Base packages: install security tools
+echo "Installing security-related packages (dnf may ask prompts)"
+REQUIRED_PKGS=(dnf-automatic firewalld audit policycoreutils-python-utils libpwquality)
+OPTIONAL_PKGS=(fail2ban)
+dnf -y install "${REQUIRED_PKGS[@]}"
+for pkg in "${OPTIONAL_PKGS[@]}"; do
+  if ! dnf -y install "$pkg" 2>/tmp/harden-splunk-${pkg}.log; then
+    echo "WARNING: Optional package ${pkg} could not be installed. Check repositories if you rely on it."
+    cat /tmp/harden-splunk-${pkg}.log >&2 || true
+  fi
+  rm -f /tmp/harden-splunk-${pkg}.log
+done
+
+# 3) Enable and enforce SELinux
+echo "Setting SELinux to enforcing"
+if [ -f /etc/selinux/config ]; then
+  sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
+  if command -v setenforce >/dev/null 2>&1; then
+    setenforce Enforcing || true
+  fi
+fi
+
+# 4) Enable automatic security updates
+echo "Configuring automatic security updates (dnf-automatic)"
+sed -i 's/^apply_updates = .*/apply_updates = yes/' /etc/dnf/automatic.conf || true
+# ensure timer/service enabled
+enable_unit_if_available "dnf-automatic.timer"
+
+# 5) sysctl hardening
+echo "Applying hardened sysctl settings"
+cat >/etc/sysctl.d/99-hardening.conf <<'EOF'
+# Network hardening
+net.ipv4.ip_forward = 0
+net.ipv6.conf.all.forwarding = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.tcp_syncookies = 1
+# filesystem & misc
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+# reduce exposure of kernel pointers (if supported)
+kernel.kptr_restrict = 1
+# disable ICMP redirects
+net.ipv4.conf.all.secure_redirects = 1
+EOF
+/sbin/sysctl --system >/dev/null
+
+# 6) SSH hardening
+echo "Hardening SSH (/etc/ssh/sshd_config)"
+SSHD_CFG="/etc/ssh/sshd_config"
+cp -n "${SSHD_CFG}" "${SSHD_CFG}.bak.$(date +%s)" || true
+# set conservative options; do NOT change port automatically
+grep -q '^PermitRootLogin' "${SSHD_CFG}" && sed -i 's/^PermitRootLogin.*/PermitRootLogin no/' "${SSHD_CFG}" || echo "PermitRootLogin no" >>"${SSHD_CFG}"
+grep -q '^PasswordAuthentication' "${SSHD_CFG}" && sed -i 's/^PasswordAuthentication.*/PasswordAuthentication no/' "${SSHD_CFG}" || echo "PasswordAuthentication no" >>"${SSHD_CFG}"
+grep -q '^PermitEmptyPasswords' "${SSHD_CFG}" && sed -i 's/^PermitEmptyPasswords.*/PermitEmptyPasswords no/' "${SSHD_CFG}" || echo "PermitEmptyPasswords no" >>"${SSHD_CFG}"
+grep -q '^MaxAuthTries' "${SSHD_CFG}" && sed -i 's/^MaxAuthTries.*/MaxAuthTries 4/' "${SSHD_CFG}" || echo "MaxAuthTries 4" >>"${SSHD_CFG}"
+grep -q '^X11Forwarding' "${SSHD_CFG}" && sed -i 's/^X11Forwarding.*/X11Forwarding no/' "${SSHD_CFG}" || echo "X11Forwarding no" >>"${SSHD_CFG}"
+# ensure sshd reload
+systemctl reload sshd || systemctl restart sshd || true
+
+# 7) Firewalld configuration: allow only necessary ports
+echo "Configuring firewalld (allow only Splunk ports for localhost and ADMIN_NETS)"
+if command -v firewall-cmd >/dev/null 2>&1; then
+  enable_unit_if_available "firewalld"
+
+  # add zone rules
+  # ensure loopback allowed
+  firewall-cmd --permanent --zone=trusted --add-interface=lo >/dev/null 2>&1 || true
+
+  # Helper to open Splunk ports only to admin nets and loopback
+  open_port_for_admins() {
+    local port="$1"
+    # allow only from loopback
+    firewall-cmd --permanent --zone=trusted --add-rich-rule="rule family='ipv4' source address='127.0.0.1' port port='${port}' protocol='tcp' accept" >/dev/null 2>&1 || true
+    # allow from any ADMIN_NETS
+    if [ "${#ADMIN_NETS[@]}" -gt 0 ]; then
+      for cidr in "${ADMIN_NETS[@]}"; do
+        firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='${cidr}' port port='${port}' protocol='tcp' accept" >/dev/null 2>&1 || true
+      done
+    else
+      # if no ADMIN_NETS defined, keep Splunk ports accessible only locally
+      echo "ADMIN_NETS not set: Splunk ports left accessible only from localhost (trusted zone)."
+    fi
+  }
+
+  for p in "${SPLUNK_WEB_PORTS[@]}"; do open_port_for_admins "${p}"; done
+  for p in "${SPLUNK_MGMT_PORTS[@]}"; do open_port_for_admins "${p}"; done
+
+  # Close common unnecessary services to public
+  # Ensure default zone is public and restrict it
+  firewall-cmd --reload
+else
+  echo "WARNING: firewalld/firewall-cmd not available; skipping firewall configuration."
+fi
+
+# 8) Disable unused services (safe best-effort)
+echo "Masking/disabling common unnecessary services if present"
+for svc in avahi-daemon cups bluetooth nfs-server rpcbind slapd lpd ; do
+  if systemctl list-unit-files | grep -q "^${svc}"; then
+    systemctl disable --now "${svc}" 2>/dev/null || true
+    systemctl mask "${svc}" 2>/dev/null || true
+    echo "Disabled/masked ${svc}"
+  fi
+done
+
+# 9) File permissions for Splunk directory
+echo "Setting permissions for Splunk files"
+if [ -d "${SPLUNK_HOME}" ]; then
+  chown -R "${SPLUNK_USER}:${SPLUNK_GROUP}" "${SPLUNK_HOME}"
+  find "${SPLUNK_HOME}" -type d -exec chmod 750 {} +
+  # capture files that already have an execute bit before tightening perms
+  mapfile -t _splunk_execs < <(find "${SPLUNK_HOME}" -type f -perm -u=x) || _splunk_execs=()
+  find "${SPLUNK_HOME}" -type f -exec chmod 640 {} +
+  for exec_path in "${_splunk_execs[@]}"; do
+    chmod 750 "${exec_path}" || true
+  done
+  unset _splunk_execs
+else
+  echo "WARNING: ${SPLUNK_HOME} not found; skipping Splunk file perms. Create directory or update SPLUNK_HOME"
+fi
+
+# 10) Disable core dumps
+echo "Disabling core dumps (limits.conf)"
+grep -q "${SPLUNK_USER}.*hard.*core" /etc/security/limits.conf || echo "${SPLUNK_USER} hard core 0" >> /etc/security/limits.conf
+sed -i '/^#*CrashDump/d' /etc/systemd/coredump.conf || true
+cat >> /etc/systemd/coredump.conf <<'EOF'
+[Crash]
+Storage=none
+ProcessSizeMax=0
+EOF
+
+# 11) PAM / password complexity and expiry
+echo "Configuring password complexity and expiry defaults"
+# pwquality
+if [ -f /etc/security/pwquality.conf ]; then
+  sed -i 's/^#*minlen.*/minlen = 12/' /etc/security/pwquality.conf || echo "minlen = 12" >> /etc/security/pwquality.conf
+  sed -i 's/^#*dcredit.*/dcredit = -1/' /etc/security/pwquality.conf || echo "dcredit = -1" >> /etc/security/pwquality.conf
+  sed -i 's/^#*ucredit.*/ucredit = -1/' /etc/security/pwquality.conf || echo "ucredit = -1" >> /etc/security/pwquality.conf
+  sed -i 's/^#*lcredit.*/lcredit = -1/' /etc/security/pwquality.conf || echo "lcredit = -1" >> /etc/security/pwquality.conf
+  sed -i 's/^#*ocredit.*/ocredit = -1/' /etc/security/pwquality.conf || echo "ocredit = -1" >> /etc/security/pwquality.conf
+fi
+# password aging defaults
+if grep -q "^PASS_MAX_DAYS" /etc/login.defs; then
+  sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS   90/' /etc/login.defs
+else
+  echo "PASS_MAX_DAYS   90" >> /etc/login.defs
+fi
+
+# 12) Auditd rules
+echo "Installing auditd rules for Splunk and critical files"
+audit_rules_file="/etc/audit/rules.d/splunk.rules"
+cat >"${audit_rules_file}" <<EOF
+-w ${SPLUNK_HOME} -p wa -k splunk_config
+-w /etc/ssh/sshd_config -p wa -k ssh_config
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group -p wa -k identity
+EOF
+chmod 0640 "${audit_rules_file}"
+augenrules --load || true
+
+# 13) fail2ban basic config for SSH
+if rpm -q fail2ban >/dev/null 2>&1; then
+  echo "Configuring fail2ban for SSH"
+  mkdir -p /etc/fail2ban/jail.d
+  cat >/etc/fail2ban/jail.d/local.conf <<'EOF'
+[sshd]
+enabled = true
+port    = ssh
+filter  = sshd
+logpath = /var/log/secure
+maxretry = 4
+bantime = 3600
+EOF
+  enable_unit_if_available "fail2ban"
+else
+  echo "NOTE: fail2ban not present; skipped jail configuration."
+fi
+
+# 14) umask and profile hardening
+echo "Setting system-wide umask and disabling world-readable home directories"
+cat >/etc/profile.d/99-umask.sh <<'EOF'
+# System-wide secure umask
+umask 027
+EOF
+chmod 0644 /etc/profile.d/99-umask.sh
+
+# set home directory permissions to 750 for local users (best-effort)
+for d in /home/*; do
+  if [ -d "${d}" ]; then
+    chmod 750 "${d}" || true
+  fi
+done
+
+# 15) ensure auditd & rsyslog are running
+enable_unit_if_available "auditd"
+enable_unit_if_available "rsyslog"
+
+# 16) Optional: create a minimal systemd unit to manage Splunk as non-root (commented)
+SERVICE_FILE="/etc/systemd/system/splunk.service"
+if [ ! -f "${SERVICE_FILE}" ]; then
+  cat >"${SERVICE_FILE}" <<EOF
+# Minimal systemd unit for Splunk (optional)
+# NOTE: Many Splunk installs use their own startup script. Review before enabling.
+[Unit]
+Description=Splunkd
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=${SPLUNK_HOME}/bin/splunk start --accept-license --answer-yes
+ExecStop=${SPLUNK_HOME}/bin/splunk stop
+User=${SPLUNK_USER}
+Group=${SPLUNK_GROUP}
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 644 "${SERVICE_FILE}"
+  systemctl daemon-reload || true
+  echo "Created ${SERVICE_FILE} (disabled). If you want to enable it, run: systemctl enable --now splunk"
+fi
+
+# 17) Logging & rotation: ensure /var/log has correct perms
+echo "Reviewing Splunk log directory permissions"
+if [ -d /var/log/splunk ]; then
+  chmod 750 /var/log/splunk || true
+else
+  echo "NOTE: /var/log/splunk not found; skipping specific log permission update."
+fi
+
+# 18) Final recommendations/notes summary
+cat <<'SUMMARY'
+
+Hardening script completed (idempotent operations applied where possible).
+
+Manual follow-ups you should do now (not automated by this script):
+  1) Inside Splunk:
+     - Ensure Splunk runs as non-root (verify start scripts / systemd unit).
+     - Configure SplunkWeb and management (8089/8000) to use TLS (certs) and require strong passwords.
+     - Restrict Splunk remote management to admin networks only in Splunk config.
+     - Configure role-based access controls and audit logging in Splunk.
+     - Configure Splunk internal SSL for forwarders/indexers if present.
+  2) Backups:
+     - Take a full backup of ${SPLUNK_HOME} and verify restore.
+  3) Test:
+     - Test login via SSH key-based auth, validate that root login is disabled.
+     - Run audit event tests (modify an audited file) and check audit logs.
+  4) Monitoring:
+     - Ensure host-based monitoring and alerts (e.g., idps, ossec/wazuh, Splunk inputs) are configured.
+  5) Confirm network:
+     - Verify firewall rules from a remote admin host; if ADMIN_NETS need to be changed, edit the top of this script and re-run.
+
+If anything failed in this run, check /var/log/messages, /var/log/secure, and journalctl -xe.
+
+SUMMARY
+
+exit 0
