@@ -102,13 +102,6 @@ EOF
       --accept-license --answer-yes --no-prompt >/dev/null 2>&1 || true
   fi
 
-  say "Starting/restarting Splunk via systemd"
-  systemctl daemon-reload || true
-  systemctl enable --now splunk 2>/dev/null || true
-  systemctl restart splunk 2>/dev/null || su -s /bin/bash -c "\"${SPLUNK_HOME}/bin/splunk\" restart" "${SPLUNK_USER}" || true
-else
-  warn "SPLUNK_HOME=${SPLUNK_HOME} not found; skipping Splunk config"
-fi
 
 # -------------------- Firewalld: open 8000 & 9997 to all --------------------
 if command -v firewall-cmd >/dev/null 2>&1; then
