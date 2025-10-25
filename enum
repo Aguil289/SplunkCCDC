@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# ccdc-enum-linux.sh — host & service inventory for CCDC
+# Tested on Oracle Linux 9.x (RHEL9/Fedora-based). Run as root.
+
+set -euo pipefail
+TS="$(date +%Y%m%d_%H%M%S)"
+HOST="$(hostname -s || echo unknown)"
+OUTDIR="${PWD}/ccdc_enum_${HOST}_${TS}"
+mkdir -p "$OUTDIR"
+log(){ echo -e "\n===== $* =====\n" | tee -a "$OUTDIR/_run.log"; }
+
+capture(){  # capture "title" "command..."
+  local title="$1"; shift
+  log "$title"
+  { echo "## $title"; echo '$' "$*"; eval "$@" 2>&1 || true; echo; } \
+    > "$OUTDIR/$(echo "$title" | tr ' /' '__').txt"
+}
+
+# System basics
+capture "system-info" 'uname -a; hostnamectl; cat /etc/os-release; date; uptime'
+capture "users-and-groups" 'getent passwd; echo; getent group'
+capture "who-and-last" 'who -a; echo; last -n 20 || true'
+capture "sudoers" 'grep -Rhv "^\s*#" /etc/sudoers /etc/sudoers.d/* 2>/dev/null || true'
+capture "root-and-wheel" 'awk -F: "\$3==0{print}" /etc/passwd; getent group wheel || true'
+
+# Packages
+if command -v rpm >/dev/null; then
+  capture "packages-rpm" 'rpm -qa --last'
+fi
+if command -v dnf >/dev/null; then
+  capture "repos-and-updates" 'dnf repolist; echo; dnf check-update || true'
+fi
+
+# Networking
+capture "ip-and-routes" 'ip -br addr; echo; ip route'
+capture "dns-config" 'test -x /usr/bin/resolvectl && resolvectl status || cat /etc/resolv.conf'
+capture "neighbors-arp" 'ip neigh show || arp -an || true'
+capture "listening-ports" 'ss -tulpen || netstat -tulpen || true'
+capture "established-conns" 'ss -tan state established || true'
+
+# Firewall / SELinux
+if command -v firewall-cmd >/dev/null; then
+  capture "firewalld" 'firewall-cmd --state; firewall-cmd --get-active-zones; firewall-cmd --list-all --zone=public || true'
+fi
+if command -v nft >/dev/null; then
+  capture "nft-ruleset" 'nft list ruleset'
+elif command -v iptables >/dev/null; then
+  capture "iptables-rules" 'iptables -S; ip6tables -S || true'
+fi
+capture "selinux" 'getenforce 2>/dev/null || echo "getenforce not available"; sestatus 2>/dev/null || true'
+
+# Services/processes
+capture "running-services" 'systemctl list-units --type=service --state=running --no-pager'
+capture "enabled-services" 'systemctl list-unit-files --type=service --state=enabled --no-pager'
+capture "top-processes" 'ps aux --sort=-%cpu | head -n 40; echo; ps aux --sort=-%mem | head -n 40'
+
+# Schedules / persistence
+capture "timers" 'systemctl list-timers --all --no-pager'
+capture "cron" 'crontab -l 2>/dev/null || true; echo; ls -la /etc/cron* 2>/dev/null || true'
+
+# Filesystems & shares
+capture "mounts-and-disk" 'df -h; echo; lsblk -o NAME,SIZE,TYPE,MOUNTPOINT; echo; mount'
+capture "ssh-config" 'test -f /etc/ssh/sshd_config && cat /etc/ssh/sshd_config || echo "no sshd_config"'
+
+# Logs (recent errors)
+capture "recent-critical-logs" 'journalctl -p 3 -n 200 --no-pager || true'
+
+# Splunk specifics (adjust SPLUNK_HOME if needed)
+SPLUNK_HOME="/opt/splunk"
+if [ -x "$SPLUNK_HOME/bin/splunk" ]; then
+  capture "splunk-version" "$SPLUNK_HOME/bin/splunk version"
+  capture "splunk-status" "systemctl status splunk 2>&1 || $SPLUNK_HOME/bin/splunk status"
+  capture "splunk-ports" "grep -RhinE '^(splunkd\.port|mgmtHostPort|httpPort|port\s*=|targetHost|targetIp|listen)' $SPLUNK_HOME/etc 2>/dev/null || true"
+  tar -czf "$OUTDIR/splunk_etc_snippets.tgz" -C "$SPLUNK_HOME" etc
+fi
+
+# Optional: quick local subnet sweep if nmap exists
+if command -v nmap >/dev/null; then
+  # try to detect a /24 from the primary interface
+  CIDR="$(ip -4 addr show scope global | awk '/inet /{print $2; exit}')"
+  [ -n "${CIDR:-}" ] && capture "nmap-ping-sweep" "nmap -sn $CIDR" || true
+fi
+
+# Package the results
+TAR="ccdc_enum_${HOST}_${TS}.tar.gz"
+tar -czf "$TAR" -C "$(dirname "$OUTDIR")" "$(basename "$OUTDIR")"
+echo -e "\nDONE: $(realpath "$TAR")"
