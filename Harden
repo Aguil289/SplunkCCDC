@@ -47,8 +47,8 @@ sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config || true
 command -v setenforce >/dev/null 2>&1 && setenforce 1 || true
 dnf -y install policycoreutils-python-utils setools-console >/dev/null 2>&1 || true
 
-# -------------------- Optional: disable SSH (comment if you need SSH) --------------------
-say "Disabling SSH service to reduce attack surface (comment this out to keep SSH enabled)"
+# -------------------- Disable SSH  --------------------
+say "Disabling SSH service to reduce attack surface"
 systemctl disable --now sshd 2>/dev/null || true
 systemctl mask sshd 2>/dev/null || true
 
