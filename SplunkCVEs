@@ -1,0 +1,90 @@
+#!/bin/bash
+# Hardening script for Splunk Enterprise 9.1.1
+# **Be sure to backup configuration files and test in non‑prod first**
+
+SPLUNK_HOME="/opt/splunk"  # adjust as needed
+WEB_CONF="${SPLUNK_HOME}/etc/system/local/web.conf"
+SERVER_CONF="${SPLUNK_HOME}/etc/system/local/server.conf"
+AUTH_CONF="${SPLUNK_HOME}/etc/system/local/authentication.conf"
+LOG_LEVEL_CONF="${SPLUNK_HOME}/etc/system/local/log.cfg"
+SPLUNK_USER="splunk"      # the OS user Splunk runs as; adjust if different
+SPLUNK_GROUP="splunk"
+
+echo "[*] Starting hardening actions for Splunk 9.1.1"
+
+# 1. Restrict debug logging — disable debug mode / JWT debug
+echo "[*] Disabling debug logging for JWT and general debug level"
+if grep -q "^log_level" ${LOG_LEVEL_CONF} ; then
+  sed -i.bak '/^log_level/c\log_level = INFO' ${LOG_LEVEL_CONF}
+else
+  echo "log_level = INFO" >> ${LOG_LEVEL_CONF}
+fi
+
+# In case JWT component might be logging at debug
+if grep -q "JsonWebToken" ${LOG_LEVEL_CONF} ; then
+  sed -i '/JsonWebToken/c\# JsonWebToken debug disabled' ${LOG_LEVEL_CONF}
+fi
+
+# 2. In web.conf: disable “enableSplunkWebClientNetloc” if present (mitigates SSRF). Reference: SVD‑2025‑1007 series :contentReference[oaicite:5]{index=5}
+echo "[*] Ensuring SSRF mitigation setting in web.conf"
+mkdir -p "$(dirname ${WEB_CONF})"
+if grep -q "^enableSplunkWebClientNetloc" ${WEB_CONF} ; then
+  sed -i '/^enableSplunkWebClientNetloc/c\enableSplunkWebClientNetloc = false' ${WEB_CONF}
+else
+  echo "enableSplunkWebClientNetloc = false" >> ${WEB_CONF}
+fi
+
+# 3. Restrict or disable Splunk Web if not needed
+echo "[*] Checking if Splunk Web is needed; consider disabling if not required"
+# If you want to disable Splunk Web entirely:
+# ${SPLUNK_HOME}/bin/splunk disable web
+
+# 4. Restrict file permissions especially for Splunk config dirs
+echo "[*] Fixing file ownership & permissions"
+chown -R ${SPLUNK_USER}:${SPLUNK_GROUP} ${SPLUNK_HOME}
+find ${SPLUNK_HOME} -type d -exec chmod 750 {} \;
+find ${SPLUNK_HOME} -type f -exec chmod 640 {} \;
+# Ensure executable permissions only where needed (bin, etc)
+find ${SPLUNK_HOME}/bin -type f -exec chmod 750 {} \;
+
+# 5. Restrict internal index access / roles / capabilities
+echo "[*] Reviewing role & capability settings: ensure only necessary roles have change_authentication, admin capabilities"
+# Note: manual step required: audit roles in Splunk UI or via CLI:
+#   splunk list roles
+#   splunk edit role [role] - remove capability change_authentication
+# For automation one could use splunk CLI or REST API but that is environment‑specific
+
+# 6. Mitigate path‐traversal CVE‑2024‑36991 via Splunk Web endpoint (if using Splunk Web) :contentReference[oaicite:6]{index=6}
+echo "[*] Ensuring endpoint restrictions for /modules/messaging/ if possible"
+# This may require web server or firewall rule to restrict access:
+# Example iptables / firewall rule to block public access to that endpoint
+# (Assumes default Splunk Web port 8000)
+# iptables -A INPUT -p tcp --dport 8000 -m string --string "/modules/messaging/" --algo bm -j DROP
+
+# 7. Rotate secrets & tokens if needed (per SVD‑2024‑0301) :contentReference[oaicite:7]{index=7}
+echo "[*] If tokens may have been exposed (debug logging earlier), rotate authentication tokens & secrets"
+# Manual process: splunk rotate-auth-tokens (or delete old tokens in UI)
+
+# 8. Ensure all communication is encrypted (TLS) & disable weak ciphers
+echo "[*] Verifying TLS settings / cipher suite hardening"
+# Example: in server.conf under [sslConfig]
+mkdir -p "$(dirname ${SERVER_CONF})"
+if ! grep -q "\[sslConfig\]" ${SERVER_CONF} ; then
+  cat <<EOL >> ${SERVER_CONF}
+[sslConfig]
+sslVersions = TLSv1.2 TLSv1.3
+sslCiphers = HIGH:!aNULL:!MD5:!3DES
+EOL
+else
+  sed -i '/^sslVersions/c\sslVersions = TLSv1.2 TLSv1.3' ${SERVER_CONF}
+  sed -i '/^sslCiphers/c\sslCiphers = HIGH:!aNULL:!MD5:!3DES' ${SERVER_CONF}
+fi
+
+# 9. Ensure system hardening – disable unnecessary services, OS patches applied
+echo "[*] Reminding: ensure underlying OS is patched; disable unnecessary services on the Splunk host"
+
+# 10. Log & monitor for anomalies
+echo "[*] Enable audit logging and monitor for suspicious activity"
+# In Splunk: ensure internal indexes like _audit and _internal are monitored, alert for unusual events.
+
+echo "[*] Hardening script complete. Please restart Splunk and validate configuration."
