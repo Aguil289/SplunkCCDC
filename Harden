@@ -1,70 +1,45 @@
 #!/usr/bin/env bash
-# harden-oracle9-splunk-ccdc-fixed.sh
-# Oracle Linux 9.x + Splunk 9.x, CCDC-style hardening (no package updates here).
-# Run as root. Idempotent where possible.
-
-dnf clean all && dnf makecache && dnf update -y && dnf autoremove -y
+# harden-oracle9-splunk-ccdc-openweb.sh
+# Splunk-only hardening but DO NOT BLOCK/RESTRICT IPs.
+# Splunk Web (8000) is left reachable by any IP (no drop rules).
+# Run as root.
 
 set -euo pipefail
 IFS=$'\n\t'
+
+# ---------------------- EDIT THESE ----------------------
+SPLUNK_HOME="/opt/splunk"
+SPLUNK_USER="splunk"
+SPLUNK_GROUP="splunk"
+
+# If you want to allow specific admin nets for local mgmt later, set them here (not required)
+ADMIN_NETS=()    # e.g. ("172.20.5.0/24")  (not used for blocking)
+SCORING_IPS=()   # not used for blocking; left for logging/notes
+# Splunk ports
+SPLUNK_WEB_PORT=8000
+SPLUNK_MGMT_PORT=8089    # will be bound to localhost only
+# -------------------------------------------------------
 
 TS="$(date +%Y%m%d_%H%M%S)"
 BACKUP_DIR="/root/ccdc_backups_${TS}"
 mkdir -p "$BACKUP_DIR"
 
-##### CCDC VARS (EDIT THESE) #####
-SPLUNK_HOME="/opt/splunk"
-SPLUNK_USER="splunk"
-SPLUNK_GROUP="splunk"
-
-# Ports
-SPLUNK_WEB_PORTS=(8000)
-SPLUNK_MGMT_PORTS=(8089)
-SPLUNK_REPLICATION_PORTS=(8080)
-SPLUNK_FORWARDER_PORTS=(9997)
-
-# Competition nets (tighten to your blue-team / admin LAN)
-# Example for practice: ADMIN_NETS=("172.20.0.0/16")
-ADMIN_NETS=()
-
-# If you’re given explicit scoring IPs and must allow them to hit web/health, add here:
-SCORING_IPS=()
-
-###################################
-
-bkp() { [ -f "$1" ] && cp -p "$1" "${BACKUP_DIR}/$(basename "$1").${TS}" || true; }
-say() { echo -e "[+] $*"; }
-warn() { echo -e "[-] $*" >&2; }
+bkp(){ [ -f "$1" ] && cp -p "$1" "${BACKUP_DIR}/$(basename "$1").${TS}" || true; }
+say(){ echo -e "[+] $*"; }
+warn(){ echo -e "[-] $*" >&2; }
 
 [ "$(id -u)" -eq 0 ] || { echo "ERROR: run as root"; exit 2; }
 
-say "Backups → $BACKUP_DIR"
+say "Backups -> $BACKUP_DIR"
 for f in \
-  /etc/ssh/sshd_config \
   /etc/selinux/config \
+  /etc/ssh/sshd_config \
   /etc/security/limits.conf \
   /etc/login.defs \
   /etc/audit/rules.d/ccdc.rules \
   "${SPLUNK_HOME}/etc/system/local/server.conf" \
   "${SPLUNK_HOME}/etc/system/local/web.conf"
-do
-  bkp "$f"
-done
-
-# -------------------- Accounts / password policy --------------------
-say "Hardening local password policy"
-if [ -f /etc/login.defs ]; then
-  sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS   30/' /etc/login.defs || true
-  sed -i 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS   1/'  /etc/login.defs || true
-  sed -i 's/^PASS_WARN_AGE.*/PASS_WARN_AGE   7/'  /etc/login.defs || true
-fi
-
-# Expire interactive users to force rotation (skip root & splunk)
-say "Expiring interactive user passwords (except root & splunk)"
-while IFS=: read -r user _ uid gid _ home shell; do
-  [[ "$user" == "root" || "$user" == "$SPLUNK_USER" ]] && continue
-  [[ "$shell" =~ bash|zsh ]] && chage -d 0 "$user" 2>/dev/null || true
-done </etc/passwd
+do bkp "$f"; done
 
 # -------------------- SELinux --------------------
 say "Enforcing SELinux"
@@ -72,119 +47,82 @@ sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config || true
 command -v setenforce >/dev/null 2>&1 && setenforce 1 || true
 dnf -y install policycoreutils-python-utils setools-console >/dev/null 2>&1 || true
 
-# -------------------- Splunk minimal SSL & perms --------------------
+# -------------------- Optional: disable SSH (comment if you need SSH) --------------------
+say "Disabling SSH service to reduce attack surface (comment this out to keep SSH enabled)"
+systemctl disable --now sshd 2>/dev/null || true
+systemctl mask sshd 2>/dev/null || true
+
+# -------------------- Splunk minimal TLS & bind mgmt localhost --------------------
 if [ -d "${SPLUNK_HOME}" ]; then
-  say "Configuring Splunk minimal TLS (safe defaults)"
+  say "Configuring Splunk: splunkd (mgmt) -> localhost:${SPLUNK_MGMT_PORT}, SplunkWeb -> HTTPS ${SPLUNK_WEB_PORT}"
   mkdir -p "${SPLUNK_HOME}/etc/system/local"
-  # splunkd (mgmt/API)
+
   cat > "${SPLUNK_HOME}/etc/system/local/server.conf" <<'EOF'
 [sslConfig]
 enableSplunkdSSL = true
 sslVersions = tls1.2, tls1.3
 cipherSuite = TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256
 allowSslCompression = false
-# NOTE: Do NOT require client certs unless you provision them everywhere.
-# requireClientCert = true
 
 [general]
-# Keep pass4SymmKey stable unless you intentionally set a known cluster key.
+# Bind splunkd mgmt to loopback only for safety
+mgmtHostPort = 127.0.0.1:8089
 EOF
 
-  # SplunkWeb (UI)
-  cat > "${SPLUNK_HOME}/etc/system/local/web.conf" <<'EOF'
+  cat > "${SPLUNK_HOME}/etc/system/local/web.conf" <<EOF
 [settings]
 enableSplunkWebSSL = true
-httpport = 8000
-# Optional: set web cert/key here when available
-# privKeyPath = $SPLUNK_HOME/etc/auth/mycerts/web.key
-# serverCert = $SPLUNK_HOME/etc/auth/mycerts/web.pem
+httpport = ${SPLUNK_WEB_PORT}
 EOF
 
   chown -R "${SPLUNK_USER}:${SPLUNK_GROUP}" "${SPLUNK_HOME}/etc/system/local"
   chmod -R go-rwx "${SPLUNK_HOME}/etc/system/local"
 else
-  warn "SPLUNK_HOME=${SPLUNK_HOME} not found. Skipping Splunk config."
+  warn "SPLUNK_HOME=${SPLUNK_HOME} not found; skipping Splunk config"
 fi
 
-# -------------------- Firewalld (use active 'public' zone) --------------------
-if command -v firewall-cmd >/dev/null 2>&1; then
-  say "Configuring firewalld rules (public zone)"
-  systemctl enable --now firewalld >/dev/null 2>&1 || true
-  ACTIVE_ZONES="$(firewall-cmd --get-active-zones)"
-  echo "$ACTIVE_ZONES"
-
-  # Always allow localhost to hit Splunk ports
-  for p in "${SPLUNK_WEB_PORTS[@]}" "${SPLUNK_MGMT_PORTS[@]}"; do
-    firewall-cmd --permanent --zone=public --add-rich-rule="rule family=ipv4 source address=127.0.0.1 port port=${p} protocol=tcp accept" >/dev/null
-  done
-
-  # Allow ADMIN_NETS to Splunk ports (if specified)
-  if [ "${#ADMIN_NETS[@]}" -gt 0 ]; then
-    for net in "${ADMIN_NETS[@]}"; do
-      for p in "${SPLUNK_WEB_PORTS[@]}" "${SPLUNK_MGMT_PORTS[@]}"; do
-        firewall-cmd --permanent --zone=public --add-rich-rule="rule family=ipv4 source address=${net} port port=${p} protocol=tcp accept" >/dev/null
-      done
-      # Optional: forwarder & replication (open only if you actually use them)
-      for p in "${SPLUNK_FORWARDER_PORTS[@]}" "${SPLUNK_REPLICATION_PORTS[@]}"; do
-        firewall-cmd --permanent --zone=public --add-rich-rule="rule family=ipv4 source address=${net} port port=${p} protocol=tcp accept" >/dev/null
-      done
-    done
-  fi
-
-  # Allow explicit scoring IPs if provided (to 8000 only by default)
-  if [ "${#SCORING_IPS[@]}" -gt 0 ]; then
-    for ip in "${SCORING_IPS[@]}"; do
-      for p in "${SPLUNK_WEB_PORTS[@]}"; do
-        firewall-cmd --permanent --zone=public --add-rich-rule="rule family=ipv4 source address=${ip} port port=${p} protocol=tcp accept" >/dev/null
-      done
-    done
-  fi
-
-  # Explicit drops for others on Splunk ports (keeps SSH/cockpit as per zone)
-  for p in "${SPLUNK_WEB_PORTS[@]}" "${SPLUNK_MGMT_PORTS[@]}"; do
-    firewall-cmd --permanent --zone=public --add-rich-rule="rule family=ipv4 port port=${p} protocol=tcp drop" >/dev/null
-  done
-
-  firewall-cmd --reload >/dev/null
-  say "firewalld summary:"
-  firewall-cmd --list-all
-  firewall-cmd --list-rich-rules
+# -------------------- Firewalld: ensure Web port is open to all (no blocking) --------------------
+if ! command -v firewall-cmd >/dev/null 2>&1; then
+  warn "firewall-cmd missing; skipping firewall changes (assumes host firewall handled externally)"
 else
-  warn "firewall-cmd not found; skipping firewall configuration."
+  say "Ensuring Splunk Web port ${SPLUNK_WEB_PORT} is allowed to all (no IP blocking)"
+  systemctl enable --now firewalld >/dev/null 2>&1 || true
+
+  # Add service/port for web; do NOT add any drop rules or source restrictions.
+  firewall-cmd --permanent --add-port=${SPLUNK_WEB_PORT}/tcp >/dev/null 2>&1 || true
+
+  # Keep splunkd mgmt OFF the network by NOT opening 8089
+  # (8089 is only configured to 127.0.0.1 via server.conf)
+
+  firewall-cmd --reload >/dev/null 2>&1 || true
+
+  say "firewalld summary (global):"
+  firewall-cmd --list-all || true
 fi
 
-# -------------------- Audit rules (persistent via augenrules) --------------------
-say "Installing audit rules (persistent)"
+# -------------------- Audit rules (persistent) --------------------
+say "Installing persistent audit rules"
 mkdir -p /etc/audit/rules.d
 cat > /etc/audit/rules.d/ccdc.rules <<EOF
-# CCDC Audit Rules
-# Splunk configs & Apps
+# Splunk configs
 -w ${SPLUNK_HOME}/etc/system/local/ -p wa -k splunk_config_changes
 -w ${SPLUNK_HOME}/etc/apps/ -p wa -k splunk_app_changes
-
-# Critical auth & identity files
+# Identity & auth
 -w /etc/passwd -p wa -k user_changes
 -w /etc/group  -p wa -k group_changes
 -w /etc/shadow -p wa -k shadow_changes
 -w /etc/sudoers -p wa -k sudoers_changes
--w /etc/ssh/sshd_config -p wa -k sshd_config
-
 # Command logging
 -a exit,always -F arch=b64 -S execve -k command_log
 -w /usr/bin/sudo -p x -k sudo_log
 -w /bin/su -p x -k su_log
-
-# Sensitive system calls
--a always,exit -F arch=b64 -S mount -S umount2 -k mount
--a always,exit -F arch=b64 -S unlink -S rmdir -S rename -k delete
--a always,exit -F arch=b64 -S chmod -S fchmod -S fchmodat -k chmod
 EOF
 
 augenrules --load >/dev/null 2>&1 || true
 systemctl enable --now auditd >/dev/null 2>&1 || true
 
-# -------------------- AIDE (file integrity) --------------------
-say "Setting up AIDE (may take a while on first init)"
+# -------------------- AIDE --------------------
+say "Setting up AIDE (first init may take a bit)"
 dnf -y install aide >/dev/null 2>&1 || true
 if ! [ -f /var/lib/aide/aide.db.gz ]; then
   aide --init >/dev/null 2>&1 || true
@@ -201,7 +139,7 @@ EOF
 chmod +x /usr/local/bin/check_integrity
 
 # -------------------- Splunk ulimits --------------------
-say "Setting Splunk resource limits"
+say "Setting Splunk ulimits"
 mkdir -p /etc/security/limits.d
 cat > /etc/security/limits.d/splunk.conf <<EOF
 ${SPLUNK_USER} soft nofile 64000
@@ -210,8 +148,8 @@ ${SPLUNK_USER} soft nproc  16000
 ${SPLUNK_USER} hard nproc  16000
 EOF
 
-# -------------------- Lightweight monitoring --------------------
-say "Installing CCDC monitor"
+# -------------------- Lightweight monitor --------------------
+say "Installing lightweight monitor"
 cat > /usr/local/bin/ccdc_monitor.sh <<'EOF'
 #!/usr/bin/env bash
 LOG_DIR="/var/log/ccdc_monitoring"
@@ -220,25 +158,16 @@ while true; do
   TS="$(date +%Y%m%d_%H%M%S)"
   {
     echo "=== System Status ${TS} ==="
-    echo "== Top CPU =="
-    ps aux --sort=-%cpu | head -10
-    echo "== Memory =="
-    free -m
-    echo "== Disk =="
-    df -h
-    echo "== Network (listening) =="
     ss -tulpen
-    echo "== Recent SSH auth failures =="
-    (grep -E 'Failed password|authentication failure' /var/log/secure | tail -10 || true)
-    echo "== Splunk status =="
     systemctl status splunk --no-pager || true
+    tail -n 50 /var/log/messages 2>/dev/null || true
   } > "${LOG_DIR}/status_${TS}.log"
   sleep 300
 done
 EOF
 chmod +x /usr/local/bin/ccdc_monitor.sh
 
-cat > /etc/systemd/system/ccdc-monitor.service <<EOF
+cat > /etc/systemd/system/ccdc-monitor.service <<'EOF'
 [Unit]
 Description=CCDC Monitoring Service
 After=network.target
@@ -255,13 +184,13 @@ EOF
 systemctl daemon-reload
 systemctl enable --now ccdc-monitor >/dev/null 2>&1 || true
 
-say "Done. Backups at: ${BACKUP_DIR}"
+say "DONE: Splunk Web (${SPLUNK_WEB_PORT}) is reachable by any IP (no blocking)."
+say "Backups: ${BACKUP_DIR}"
 echo
-echo "Verify:"
+echo "Quick verify commands:"
 echo "  getenforce"
 echo "  firewall-cmd --list-all"
-echo "  firewall-cmd --list-rich-rules"
+echo "  ss -tulpen | egrep ':${SPLUNK_WEB_PORT}|:${SPLUNK_MGMT_PORT}'"
 echo "  sudo -u ${SPLUNK_USER} ${SPLUNK_HOME}/bin/splunk status || true"
-echo "  sudo auditctl -l | head -20"
-echo "  /usr/local/bin/check_integrity"
+
 exit 0
