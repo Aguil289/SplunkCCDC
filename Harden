@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# harden-oracle9-splunk-ccdc-openweb-9997.sh
+# harden-oracle9-splunk-ccdc-openweb.sh
 # Splunk-only hardening with NO IP blocking:
-#   - SplunkWeb 8000 open to all
+#   - Splunk Web 8000 open to all
 #   - splunkd mgmt (8089) bound to 127.0.0.1
-#   - Receiver enabled on 9997
+#   - Receiver configured on 9997 (no service restart here)
 # Adds AIDE + monitor with syslog alerts.
 # Run as root.
 
@@ -14,6 +14,7 @@ IFS=$'\n\t'
 SPLUNK_HOME="/opt/splunk"
 SPLUNK_USER="splunk"
 SPLUNK_GROUP="splunk"
+
 SPLUNK_WEB_PORT=8000
 SPLUNK_MGMT_PORT=8089      # loopback only
 SPLUNK_RECEIVE_PORT=9997   # Universal Forwarder receiver
@@ -47,17 +48,16 @@ sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config || true
 command -v setenforce >/dev/null 2>&1 && setenforce 1 || true
 dnf -y install policycoreutils-python-utils setools-console >/dev/null 2>&1 || true
 
-# -------------------- Disable SSH --------------------
-say "Disabling SSH service to reduce attack surface"
+# -------------------- Optional: disable SSH (comment out if you need SSH) --------------------
+say "Disabling SSH service to reduce attack surface (comment this section to keep SSH)"
 systemctl disable --now sshd 2>/dev/null || true
 systemctl mask sshd 2>/dev/null || true
 
-# -------------------- Splunk config --------------------
+# -------------------- Splunk minimal TLS & mgmt loopback; enable receiver (no restart) --------------------
 if [ -d "${SPLUNK_HOME}" ]; then
-  say "Configuring Splunk (mgmt -> 127.0.0.1:${SPLUNK_MGMT_PORT}, Web -> 0.0.0.0:${SPLUNK_WEB_PORT}, Receiver -> ${SPLUNK_RECEIVE_PORT})"
+  say "Configuring Splunk: mgmt -> 127.0.0.1:${SPLUNK_MGMT_PORT}, Web -> HTTPS ${SPLUNK_WEB_PORT}, Receiver -> ${SPLUNK_RECEIVE_PORT}"
   mkdir -p "${SPLUNK_HOME}/etc/system/local"
 
-  # splunkd: bind mgmt to loopback + TLS defaults
   cat > "${SPLUNK_HOME}/etc/system/local/server.conf" <<'EOF'
 [sslConfig]
 enableSplunkdSSL = true
@@ -66,55 +66,42 @@ cipherSuite = TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GC
 allowSslCompression = false
 
 [general]
+# Bind splunkd mgmt to loopback only for safety
 mgmtHostPort = 127.0.0.1:8089
 EOF
 
-  # SplunkWeb on 8000 (HTTPS)
   cat > "${SPLUNK_HOME}/etc/system/local/web.conf" <<EOF
 [settings]
 enableSplunkWebSSL = true
 httpport = ${SPLUNK_WEB_PORT}
 EOF
 
-  # Enable receiver on 9997 via inputs.conf (auth-free method)
+  # Enable receiver (will take effect on next Splunk restart; we do NOT restart here)
   cat > "${SPLUNK_HOME}/etc/system/local/inputs.conf" <<EOF
 [splunktcp://${SPLUNK_RECEIVE_PORT}]
 disabled = 0
 EOF
 
-  # Ensure ownership and labels
-  chown -R "${SPLUNK_USER}:${SPLUNK_GROUP}" "${SPLUNK_HOME}" || true
-  restorecon -Rv "${SPLUNK_HOME}" 2>/dev/null || true
+  chown -R "${SPLUNK_USER}:${SPLUNK_GROUP}" "${SPLUNK_HOME}/etc/system/local"
+  chmod -R go-rwx "${SPLUNK_HOME}/etc/system/local"
+else
+  warn "SPLUNK_HOME=${SPLUNK_HOME} not found; skipping Splunk config"
+fi
 
-  # Free 8000 if some other proc grabbed it (keep Splunk on 8000)
-  if ss -ltnp | grep -q ":${SPLUNK_WEB_PORT}"; then
-    say "Port ${SPLUNK_WEB_PORT} is in use; freeing it"
-    ss -ltnp | awk -v P=":${SPLUNK_WEB_PORT}" '$4 ~ P {print $7}' | sed 's/.*pid=\([0-9]\+\).*/\1/' | xargs -r kill -9 || true
-    sleep 1
-  fi
-
-  # Clean stale PIDs
-  rm -f "${SPLUNK_HOME}/var/run/splunk/"*.pid 2>/dev/null || true
-
-  # Create systemd unit if missing; start as splunk
-  if ! systemctl list-unit-files | grep -q '^splunk\.service'; then
-    "${SPLUNK_HOME}/bin/splunk" enable boot-start -user "${SPLUNK_USER}" \
-      --accept-license --answer-yes --no-prompt >/dev/null 2>&1 || true
-  fi
-
-
-# -------------------- Firewalld: open 8000 & 9997 to all --------------------
-if command -v firewall-cmd >/dev/null 2>&1; then
-  say "Opening ${SPLUNK_WEB_PORT}/tcp (web) and ${SPLUNK_RECEIVE_PORT}/tcp (receiver) with no IP restrictions"
+# -------------------- Firewalld: open 8000 & 9997 to all (no blocking) --------------------
+if ! command -v firewall-cmd >/dev/null 2>&1; then
+  warn "firewall-cmd missing; skipping firewall changes (assume external FW)"
+else
+  say "Opening ${SPLUNK_WEB_PORT}/tcp (web) and ${SPLUNK_RECEIVE_PORT}/tcp (receiver) to all (no IP restrictions)"
   systemctl enable --now firewalld >/dev/null 2>&1 || true
   ACTIVE_ZONE="$(firewall-cmd --get-default-zone 2>/dev/null || echo public)"
   firewall-cmd --permanent --zone="${ACTIVE_ZONE}" --add-port=${SPLUNK_WEB_PORT}/tcp >/dev/null 2>&1 || true
   firewall-cmd --permanent --zone="${ACTIVE_ZONE}" --add-port=${SPLUNK_RECEIVE_PORT}/tcp >/dev/null 2>&1 || true
+  # Do NOT open 8089; it's bound to 127.0.0.1 only via server.conf
   firewall-cmd --reload >/dev/null 2>&1 || true
+
   say "firewalld (${ACTIVE_ZONE}) summary:"
   firewall-cmd --zone="${ACTIVE_ZONE}" --list-all || true
-else
-  warn "firewall-cmd missing; skipping firewall changes (assume external FW)"
 fi
 
 # -------------------- Audit rules (persistent) --------------------
@@ -134,13 +121,15 @@ cat > /etc/audit/rules.d/ccdc.rules <<EOF
 -w /usr/bin/sudo -p x -k sudo_log
 -w /bin/su -p x -k su_log
 EOF
+
 augenrules --load >/dev/null 2>&1 || true
 systemctl enable --now auditd >/dev/null 2>&1 || true
 
 # -------------------- AIDE + syslog alerts --------------------
-say "Setting up AIDE (baseline if missing) and integrity alerting"
+say "Setting up AIDE (baseline may take a while on first run)"
 dnf -y install aide >/dev/null 2>&1 || true
 if ! [ -f /var/lib/aide/aide.db.gz ]; then
+  # Blocking init (simple). If you want non-blocking, we can background this.
   aide --init >/dev/null 2>&1 || true
   [ -f /var/lib/aide/aide.db.new.gz ] && mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
 fi
@@ -188,7 +177,8 @@ ${SPLUNK_USER} soft nproc  16000
 ${SPLUNK_USER} hard nproc  16000
 EOF
 
-# -------------------- Lightweight monitor (with syslog alerts) --------------------
+# -------------------- CCDC monitor (with syslog alerts) --------------------
+say "Installing CCDC monitor"
 tee /usr/local/bin/ccdc_monitor.sh >/dev/null <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -253,11 +243,10 @@ EOF
 systemctl daemon-reload
 systemctl enable --now ccdc-monitor >/dev/null 2>&1 || true
 
-# -------------------- Final status --------------------
-say "DONE: 8000 (web) + 9997 (receiver) open to all; 8089 bound to localhost."
+say "DONE: 8000 (web) + 9997 (receiver) opened; 8089 bound to localhost. No Splunk restart performed."
 say "Backups: ${BACKUP_DIR}"
 echo
 echo "Quick verify:"
 echo "  ss -ltnp | egrep ':${SPLUNK_WEB_PORT}|:${SPLUNK_MGMT_PORT}|:${SPLUNK_RECEIVE_PORT}'"
 echo "  firewall-cmd --get-default-zone && firewall-cmd --list-all --zone=\$(firewall-cmd --get-default-zone)"
-echo "  systemctl status splunk --no-pager"
+echo "  systemctl status ccdc-monitor --no-pager"
