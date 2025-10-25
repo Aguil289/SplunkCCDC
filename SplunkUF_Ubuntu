@@ -1,0 +1,8 @@
+wget -O splunkforwarder-9.1.1-64e843ea36b1-linux-2.6-amd64.deb "https://download.splunk.com/products/universalforwarder/releases/9.1.1/linux/splunkforwarder-9.1.1-64e843ea36b1-linux-2.6-amd64.deb"
+dpkg -i splunkforwarder-9.1.1-64e843ea36b1-linux-2.6-amd64.deb
+cd /opt/splunkforwarder/bin
+sudo ./splunk start --accept-license
+./splunk enable boot-start
+./splunk add forward-server 172.20.242.20:9997 -auth splunk:Password01
+./splunk add monitor /var/log
+./splunk restart
