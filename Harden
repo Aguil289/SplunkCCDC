@@ -81,6 +81,9 @@ else
   warn "SPLUNK_HOME=${SPLUNK_HOME} not found; skipping Splunk config"
 fi
 
+  say "Restarting Splunk to apply new configuration"
+  sudo -u "${SPLUNK_USER}" "${SPLUNK_HOME}/bin/splunk" restart || true
+
 # -------------------- Firewalld: ensure Web port is open to all (no blocking) --------------------
 if ! command -v firewall-cmd >/dev/null 2>&1; then
   warn "firewall-cmd missing; skipping firewall changes (assumes host firewall handled externally)"
@@ -137,6 +140,13 @@ mkdir -p /var/log/aide
 aide --check | tee "/var/log/aide/aide_check_${ts}.log"
 EOF
 chmod +x /usr/local/bin/check_integrity
+
+say "Setting up AIDE cron job to run every 5 minutes"
+/bin/cat > /etc/cron.d/aide-check <<EOF
+*/5 * * * * root /usr/local/bin/check_integrity
+EOF
+chmod 0644 /etc/cron.d/aide-check
+
 
 # -------------------- Splunk ulimits --------------------
 say "Setting Splunk ulimits"
