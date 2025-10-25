@@ -1,65 +1,64 @@
 #!/usr/bin/env bash
-# disable_all_except_root_splunk.sh
-# Disables every local account except those in WHITELIST.
-# Run as root. No options.
+# disable_and_reset_pw.sh
+# Locks all users except root and splunk, and sets new passwords for them.
 
 set -euo pipefail
 IFS=$'\n\t'
 
-# ---- Keep only these accounts enabled ----
+# ==========================
+# CONFIGURATION
+# ==========================
+NEW_PASS="ChangeMeNOW!"   # <--- set your desired password here
 WHITELIST=("root" "splunk")
-# -----------------------------------------
+# ==========================
 
-[ "$(id -u)" -eq 0 ] || { echo "ERROR: run as root"; exit 2; }
+[ "$(id -u)" -eq 0 ] || { echo "ERROR: Must run as root"; exit 2; }
 
 TS="$(date +%Y%m%d_%H%M%S)"
 BKDIR="/root/account_backups_${TS}"
 mkdir -p "$BKDIR"
 
-echo "[+] Backing up account DBs to ${BKDIR}"
+echo "[+] Backing up account files to ${BKDIR}"
 cp -p /etc/passwd   "${BKDIR}/passwd.${TS}"
 cp -p /etc/shadow   "${BKDIR}/shadow.${TS}"
 cp -p /etc/group    "${BKDIR}/group.${TS}"
 cp -p /etc/gshadow  "${BKDIR}/gshadow.${TS}" 2>/dev/null || true
 chmod 600 "${BKDIR}/shadow.${TS}" "${BKDIR}/gshadow.${TS}" 2>/dev/null || true
 
-# Build a quick lookup for whitelist
+# Build a quick regex lookup for whitelisted users
 WL_RE="^($(printf '%s|' "${WHITELIST[@]}" | sed 's/|$//'))$"
 
 echo "[+] Disabling all users except: ${WHITELIST[*]}"
 while IFS=: read -r user _ uid gid _ home shell; do
-  # Skip whitelisted users
   if [[ "$user" =~ $WL_RE ]]; then
-    echo "  [skip] $user"
+    echo "  [keep] $user"
     continue
   fi
 
-  # Skip non-local/system entries without home/passwd (rare), but still lock them safely
-  echo "  [lock] $user"
-
-  # 1) Lock password (adds '!' to hash)
-  usermod -L "$user" 2>/dev/null || true
-
-  # 2) Expire account (disables login entirely)
-  chage -E 0 "$user" 2>/dev/null || true
-
-  # 3) Force no-login shell (blocks shell even with keys)
-  if command -v nologin >/dev/null 2>&1; then
-    usermod -s /sbin/nologin "$user" 2>/dev/null || true
-  else
-    usermod -s /usr/sbin/nologin "$user" 2>/dev/null || true
-  fi
-
+  echo "  [disable] $user"
+  usermod -L "$user" 2>/dev/null || true     # lock account
+  chage -E 0 "$user" 2>/dev/null || true     # expire immediately
+  usermod -s /sbin/nologin "$user" 2>/dev/null || usermod -s /usr/sbin/nologin "$user" 2>/dev/null || true
 done < /etc/passwd
 
-echo "[+] Done. All non-whitelisted accounts are locked/expired/nologin."
-echo "[i] Backups are in: ${BKDIR}"
+# --------------------
+# Change root & splunk passwords
+# --------------------
+echo "[+] Changing passwords for root and splunk"
+for user in "${WHITELIST[@]}"; do
+  if id "$user" &>/dev/null; then
+    echo "${user}:${NEW_PASS}" | chpasswd
+    echo "  [updated] $user password changed"
+  else
+    echo "  [skip] $user not found"
+  fi
+done
+
+echo "[+] Done."
+echo "    All non-whitelisted accounts locked and expired."
+echo "    Root and splunk passwords set to: ${NEW_PASS}"
+echo "    Backups stored at: ${BKDIR}"
 echo
-echo "Quick checks:"
-echo "  awk -F: '\$7 !~ /nologin|false/ {print \$1, \$7}' /etc/passwd   # who still has a real shell"
-echo "  sudo passwd -S root splunk                                    # status for whitelisted users"
-echo
-echo "Restore (if needed):"
-echo "  cp ${BKDIR}/passwd.${TS}  /etc/passwd && cp ${BKDIR}/shadow.${TS} /etc/shadow"
-echo "  cp ${BKDIR}/group.${TS}   /etc/group  && cp ${BKDIR}/gshadow.${TS} /etc/gshadow  # if present"
-echo "  chmod 644 /etc/passwd /etc/group && chmod 600 /etc/shadow /etc/gshadow"
+echo "Quick verify:"
+echo "  sudo passwd -S root splunk"
+echo "  awk -F: '\$7 !~ /nologin|false/ {print \$1, \$7}' /etc/passwd"
