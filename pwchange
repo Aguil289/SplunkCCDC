@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # disable_and_reset_pw.sh
-# Locks all users except root and splunk, and sets new passwords for them.
+# Locks all users except root and splunk, and prompts once for a new password for whitelisted accounts.
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -8,7 +8,6 @@ IFS=$'\n\t'
 # ==========================
 # CONFIGURATION
 # ==========================
-NEW_PASS="Password01"   # <--- set your desired password here
 WHITELIST=("root" "splunk")
 # ==========================
 
@@ -25,7 +24,7 @@ cp -p /etc/group    "${BKDIR}/group.${TS}"
 cp -p /etc/gshadow  "${BKDIR}/gshadow.${TS}" 2>/dev/null || true
 chmod 600 "${BKDIR}/shadow.${TS}" "${BKDIR}/gshadow.${TS}" 2>/dev/null || true
 
-# Build a quick regex lookup for whitelisted users
+# Build whitelist regex
 WL_RE="^($(printf '%s|' "${WHITELIST[@]}" | sed 's/|$//'))$"
 
 echo "[+] Disabling all users except: ${WHITELIST[*]}"
@@ -42,9 +41,21 @@ while IFS=: read -r user _ uid gid _ home shell; do
 done < /etc/passwd
 
 # --------------------
-# Change root & splunk passwords
+# Prompt once for new password
 # --------------------
-echo "[+] Changing passwords for root and splunk"
+echo
+echo "[+] Enter new password to apply to all whitelisted accounts:"
+read -rsp "New password: " NEW_PASS
+echo
+read -rsp "Confirm password: " CONFIRM_PASS
+echo
+
+if [[ "$NEW_PASS" != "$CONFIRM_PASS" ]]; then
+  echo "ERROR: Passwords do not match. Aborting."
+  exit 1
+fi
+
+# Apply to all whitelisted accounts
 for user in "${WHITELIST[@]}"; do
   if id "$user" &>/dev/null; then
     echo "${user}:${NEW_PASS}" | chpasswd
@@ -54,9 +65,10 @@ for user in "${WHITELIST[@]}"; do
   fi
 done
 
+echo
 echo "[+] Done."
 echo "    All non-whitelisted accounts locked and expired."
-echo "    Root and splunk passwords set to: ${NEW_PASS}"
+echo "    Root and Splunk passwords set to the password you entered."
 echo "    Backups stored at: ${BKDIR}"
 echo
 echo "Quick verify:"
