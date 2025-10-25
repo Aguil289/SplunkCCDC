@@ -132,13 +132,36 @@ if ! [ -f /var/lib/aide/aide.db.gz ]; then
   [ -f /var/lib/aide/aide.db.new.gz ] && mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
 fi
 install -d -m 0750 /var/log/aide
-cat > /usr/local/bin/check_integrity <<'EOF'
+sudo tee /usr/local/bin/check_integrity >/dev/null <<'EOF'
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 ts="$(date +%Y%m%d_%H%M%S)"
-mkdir -p /var/log/aide
-aide --check | tee "/var/log/aide/aide_check_${ts}.log"
+LOG_DIR="/var/log/aide"
+mkdir -p "$LOG_DIR"
+
+OUT="${LOG_DIR}/aide_check_${ts}.log"
+SUMMARY="${LOG_DIR}/aide_summary_${ts}.txt"
+
+# Run AIDE check; keep exit code
+set +e
+aide --check | tee "$OUT"
+rc=$?
+set -e
+
+# Summarize key counts (Added/Removed/Changed) for quick triage
+grep -E '^(Added files:|Removed files:|Changed files:)' "$OUT" > "$SUMMARY" || true
+
+# If anything changed, raise a syslog alert (visible in /var/log/messages and journalctl)
+if [[ $rc -ne 0 ]]; then
+  logger -p authpriv.alert -t AIDE "INTEGRITY ALERT: differences detected; see $OUT and $SUMMARY"
+else
+  logger -p authpriv.info -t AIDE "Integrity OK (no differences)."
+fi
+
+exit $rc
 EOF
+sudo chmod +x /usr/local/bin/check_integrity
+
 chmod +x /usr/local/bin/check_integrity
 
 say "Setting up AIDE cron job to run every 5 minutes"
@@ -159,23 +182,68 @@ ${SPLUNK_USER} hard nproc  16000
 EOF
 
 # -------------------- Lightweight monitor --------------------
-say "Installing lightweight monitor"
-cat > /usr/local/bin/ccdc_monitor.sh <<'EOF'
+sudo tee /usr/local/bin/ccdc_monitor.sh >/dev/null <<'EOF'
 #!/usr/bin/env bash
+set -euo pipefail
 LOG_DIR="/var/log/ccdc_monitoring"
 mkdir -p "${LOG_DIR}"
+
+# Allowed listening ports (protocol:port); 8000 is Splunk Web; 8089 is mgmt (localhost-only)
+ALLOWED_PORTS=("tcp:8000" "tcp:8089")
+
 while true; do
   TS="$(date +%Y%m%d_%H%M%S)"
+  SNAP="${LOG_DIR}/status_${TS}.log"
+
+  # Gather status snapshot
   {
     echo "=== System Status ${TS} ==="
+    echo "== Splunk service =="
+    systemctl is-active splunk && systemctl --no-pager status splunk || echo "SPLUNK NOT ACTIVE"
+    echo
+
+    echo "== Listening sockets =="
     ss -tulpen
-    systemctl status splunk --no-pager || true
-    tail -n 50 /var/log/messages 2>/dev/null || true
-  } > "${LOG_DIR}/status_${TS}.log"
+    echo
+
+    echo "== Recent system messages =="
+    tail -n 100 /var/log/messages 2>/dev/null || true
+  } > "$SNAP"
+
+  # --- Alerts ---
+
+  # 1) Splunk down?
+  if ! systemctl is-active --quiet splunk; then
+    logger -p daemon.crit -t CCDC "SPLUNK DOWN: service not active"
+  fi
+
+  # 2) 8089 must be bound only to 127.0.0.1
+  # Extract all splunkd/mgmt listeners on 8089; ensure they are on 127.0.0.1
+  if ss -ltnp | awk '$4 ~ /:8089$/ {print $4}' | grep -q -v '^127\.0\.0\.1:'; then
+    logger -p authpriv.alert -t CCDC "SECURITY: splunkd (8089) is listening on non-loopback!"
+  fi
+
+  # 3) Unexpected listeners (anything not in ALLOWED_PORTS)
+  # Build allow regex
+  ALLOW_RE="$(printf '%s\n' "${ALLOWED_PORTS[@]}" | sed 's#^#^#;s#:#.*:#;s#$#$#' | paste -sd'|' -)"
+  # Get tcp listeners not loopback detail
+  BAD_LISTEN="$(ss -ltnpH | awk '{print "tcp:"$4}' | grep -Ev '127\.0\.0\.1:' | grep -Ev "${ALLOW_RE:-^$}" || true)"
+  if [[ -n "${BAD_LISTEN}" ]]; then
+    logger -p authpriv.warning -t CCDC "UNEXPECTED LISTENERS: ${BAD_LISTEN}"
+  fi
+
+  # 4) If AIDE recently flagged differences, echo a reminder (optional: look at last 10 minutes)
+  LAST_AIDE="$(ls -1t /var/log/aide/aide_summary_*.txt 2>/dev/null | head -1 || true)"
+  if [[ -n "$LAST_AIDE" ]] && grep -qv "Changed files: 0" "$LAST_AIDE"; then
+    logger -p authpriv.alert -t CCDC "AIDE: Integrity differences detected recently. See $LAST_AIDE"
+  fi
+
   sleep 300
 done
 EOF
-chmod +x /usr/local/bin/ccdc_monitor.sh
+sudo chmod +x /usr/local/bin/ccdc_monitor.sh
+sudo systemctl restart ccdc-monitor
+
 
 cat > /etc/systemd/system/ccdc-monitor.service <<'EOF'
 [Unit]
