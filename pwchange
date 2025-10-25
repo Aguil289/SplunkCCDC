@@ -8,7 +8,7 @@ IFS=$'\n\t'
 # ==========================
 # CONFIGURATION
 # ==========================
-NEW_PASS="ChangeMeNOW!"   # <--- set your desired password here
+NEW_PASS="Password01"   # <--- set your desired password here
 WHITELIST=("root" "splunk")
 # ==========================
 
