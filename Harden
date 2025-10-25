@@ -97,6 +97,8 @@ else
   ACTIVE_ZONE="$(firewall-cmd --get-default-zone 2>/dev/null || echo public)"
   firewall-cmd --permanent --zone="${ACTIVE_ZONE}" --add-port=${SPLUNK_WEB_PORT}/tcp >/dev/null 2>&1 || true
   firewall-cmd --permanent --zone="${ACTIVE_ZONE}" --add-port=${SPLUNK_RECEIVE_PORT}/tcp >/dev/null 2>&1 || true
+  firewall-cmd --permanent --add-rich-rule='rule family="ipv4" port port="8089" protocol="tcp" drop'
+  firewall-cmd --permanent --add-rich-rule='rule family="ipv6" port port="8089" protocol="tcp" drop'
   # Do NOT open 8089; it's bound to 127.0.0.1 only via server.conf
   firewall-cmd --reload >/dev/null 2>&1 || true
 
