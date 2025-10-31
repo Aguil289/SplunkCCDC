@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# ccdc-splunk-uf-setup.sh
+# Purpose: Drop a Splunk Universal Forwarder on a CCDC Linux host and point it
+#          to the blue-team Splunk at 172.20.242.20:9997 (TCP).
+# Source: adapted from "Quick Guide: Setting Up Log Forwarding from a Unix Host to a Splunk Server (v9.1.1)". 
+# Tested on: Oracle Linux 9 / RHEL 9 / CentOS Stream / Ubuntu 22.04 / Fedora
+# Run as: root
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ------------------- CCDC VARIABLES -------------------
+SPLUNK_SERVER_IP="172.20.242.20"
+SPLUNK_RECEIVER_PORT="9997"
+SPLUNK_ADMIN_USER="admin"
+SPLUNK_ADMIN_PASS="${SPLUNK_ADMIN_PASS:-Password01!}"   # override on CLI: SPLUNK_ADMIN_PASS='...' ./script.sh
+SPLUNK_VER="9.3.1"                                      # bump here when CCDC bumps
+UF_DIR="/opt/splunkforwarder"
+SPLUNK_OS="$(. /etc/os-release && echo "$ID")"
+# ------------------------------------------------------
+
+log(){ echo "[*] $*"; }
+
+need_root(){
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "[!] must run as root"; exit 1
+  fi
+}
+
+detect_pkg_mgr(){
+  if command -v dnf >/dev/null 2>&1; then
+    echo dnf
+  elif command -v yum >/dev/null 2>&1; then
+    echo yum
+  elif command -v apt-get >/dev/null 2>&1; then
+    echo apt
+  else
+    echo "[!] no supported package manager found" >&2
+    exit 1
+  fi
+}
+
+install_prereqs(){
+  local pm="$1"
+  case "$pm" in
+    dnf|yum)
+      $pm -y install wget tar
+      ;;
+    apt)
+      apt-get update -y
+      apt-get install -y wget ca-certificates
+      ;;
+  esac
+}
+
+download_uf(){
+  # CCDC environment usually preloads UF. Keep remote URL as fallback.
+  local pm="$1"
+  local tmpdir="/tmp/splunkuf.$$"
+  mkdir -p "$tmpdir"
+  log "downloading Splunk UF $SPLUNK_VER into $tmpdir"
+  if [ "$pm" = "apt" ]; then
+    # Debian-style
+    wget -O "$tmpdir/splunkforwarder-${SPLUNK_VER}-linux-amd64.deb" \
+      "https://download.splunk.com/products/universalforwarder/releases/${SPLUNK_VER}/linux/splunkforwarder-${SPLUNK_VER}-linux-2.6-amd64.deb"
+    echo "$tmpdir/splunkforwarder-${SPLUNK_VER}-linux-amd64.deb"
+  else
+    # RHEL-style
+    wget -O "$tmpdir/splunkforwarder-${SPLUNK_VER}-linux-x86_64.rpm" \
+      "https://download.splunk.com/products/universalforwarder/releases/${SPLUNK_VER}/linux/splunkforwarder-${SPLUNK_VER}-linux-2.6-x86_64.rpm"
+    echo "$tmpdir/splunkforwarder-${SPLUNK_VER}-linux-x86_64.rpm"
+  fi
+}
+
+install_uf(){
+  local pm="$1"
+  local pkg="$2"
+  log "installing Splunk UF package"
+  if [ "$pm" = "apt" ]; then
+    dpkg -i "$pkg" || apt-get install -f -y
+  else
+    rpm -Uvh "$pkg"
+  fi
+}
+
+create_splunk_user(){
+  # harden so splunk doesn’t run as root
+  if ! id splunk >/dev/null 2>&1; then
+    log "creating splunk service account"
+    useradd -r -s /sbin/nologin splunk
+  else
+    log "splunk user already exists"
+  fi
+  chown -R splunk:splunk "$UF_DIR" || true
+}
+
+start_uf(){
+  log "starting UF and enabling boot-start"
+  # first start must accept license
+  "$UF_DIR/bin/splunk" start --accept-license --answer-yes --no-prompt
+  "$UF_DIR/bin/splunk" enable boot-start -user splunk
+}
+
+configure_forward_server(){
+  log "configuring forward-server ${SPLUNK_SERVER_IP}:${SPLUNK_RECEIVER_PORT}"
+  "$UF_DIR/bin/splunk" add forward-server "${SPLUNK_SERVER_IP}:${SPLUNK_RECEIVER_PORT}" \
+    -auth "${SPLUNK_ADMIN_USER}:${SPLUNK_ADMIN_PASS}" || true
+  "$UF_DIR/bin/splunk" list forward-server
+}
+
+add_monitors(){
+  log "adding common Linux monitors"
+  # general
+  "$UF_DIR/bin/splunk" add monitor /var/log
+  # RHEL/Oracle
+  [ -f /var/log/secure ] && "$UF_DIR/bin/splunk" add monitor /var/log/secure
+  [ -f /var/log/messages ] && "$UF_DIR/bin/splunk" add monitor /var/log/messages
+  # Audit
+  [ -f /var/log/audit/audit.log ] && "$UF_DIR/bin/splunk" add monitor /var/log/audit/audit.log
+  # SSH + passwd changes (to catch red team)
+  [ -f /etc/passwd ] && "$UF_DIR/bin/splunk" add monitor /etc/passwd
+  [ -f /etc/shadow ] && "$UF_DIR/bin/splunk" add monitor /etc/shadow
+  [ -f /etc/ssh/sshd_config ] && "$UF_DIR/bin/splunk" add monitor /etc/ssh/sshd_config
+  # web servers commonly used in CCDC
+  [ -d /var/log/httpd ] && "$UF_DIR/bin/splunk" add monitor /var/log/httpd
+  [ -d /var/log/apache2 ] && "$UF_DIR/bin/splunk" add monitor /var/log/apache2
+  [ -d /var/log/nginx ] && "$UF_DIR/bin/splunk" add monitor /var/log/nginx
+}
+
+lock_outputs_conf(){
+  # write clean outputs.conf instead of CLI so attackers can’t just splunk remove forward-server
+  local confdir="$UF_DIR/etc/system/local"
+  mkdir -p "$confdir"
+  cat > "$confdir/outputs.conf" <<EOF
+[tcpout]
+defaultGroup = ccdc-splunk
+
+[tcpout:ccdc-splunk]
+server = ${SPLUNK_SERVER_IP}:${SPLUNK_RECEIVER_PORT}
+autoLB = true
+
+# uncomment if CCDC requires SSL
+#useSSL = true
+#[sslConfig]
+#rootCA = \$SPLUNK_HOME/etc/auth/cacert.pem
+EOF
+
+  chown -R splunk:splunk "$confdir"
+  chmod 640 "$confdir/outputs.conf"
+  log "outputs.conf written and permissions set"
+}
+
+open_firewall_if_local_indexer(){
+  # if this script runs on the actual Splunk server, open 9997
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    log "configuring firewalld for TCP 9997"
+    firewall-cmd --add-port=9997/tcp --permanent || true
+    firewall-cmd --reload || true
+  fi
+}
+
+restart_uf(){
+  log "restarting UF to apply configs"
+  "$UF_DIR/bin/splunk" restart
+}
+
+show_status(){
+  echo
+  log "FINAL STATUS"
+  "$UF_DIR/bin/splunk" status || true
+  echo
+  log "CONFIGURED FOR: ${SPLUNK_SERVER_IP}:${SPLUNK_RECEIVER_PORT}"
+  log "MONITORS:"
+  "$UF_DIR/bin/splunk" list monitor || true
+  log "FORWARD-SERVERS:"
+  "$UF_DIR/bin/splunk" list forward-server || true
+}
+
+main(){
+  need_root
+  local pm
+  pm="$(detect_pkg_mgr)"
+  install_prereqs "$pm"
+  local pkg
+  pkg="$(download_uf "$pm")"
+  install_uf "$pm" "$pkg"
+  create_splunk_user
+  start_uf
+  configure_forward_server
+  add_monitors
+  lock_outputs_conf
+  open_firewall_if_local_indexer
+  restart_uf
+  show_status
+}
+
+main "$@"
