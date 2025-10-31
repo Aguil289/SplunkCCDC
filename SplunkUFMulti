@@ -1,35 +1,48 @@
 #!/usr/bin/env bash
 #
-# MWCCDC 2025 – Unified Splunk Universal Forwarder installer
-#
-# Usage (non-interactive):
-#   ./ccdc-uf.sh                           # uses 172.20.241.20:9997
-#   ./ccdc-uf.sh 172.20.241.20             # still uses 9997
-#   ./ccdc-uf.sh 172.20.242.20 9997        # only if packet/inject says indexer is .242.20
+# MWCCDC 2025 – Splunk Universal Forwarder installer 
+# Usage:
+#   ./ccdc-uf.sh
+#   ./ccdc-uf.sh 172.20.241.20          # still 9997
+#   ./ccdc-uf.sh 172.20.242.20 9997     # only if White/Gold says so
 #   ./ccdc-uf.sh 172.20.241.20 9997 admin 'StrongPass!'
 #
 
 # ---------- TEAM PACKET DEFAULTS ----------
-PACKET_INDEXER_IP="172.20.241.20"    
-PACKET_INDEXER_PORT="9997"          
+PACKET_INDEXER_IP="172.20.241.20"
+PACKET_INDEXER_PORT="9997"
+
 DEFAULT_ADMIN_USERNAME="admin"
 DEFAULT_ADMIN_PASSWORD="Changeme123!"   # change after install
 
 INDEXER_IP="${1:-$PACKET_INDEXER_IP}"
+# port is forced to packet value unless you override with arg 2
 INDEXER_PORT="${2:-$PACKET_INDEXER_PORT}"
 ADMIN_USERNAME="${3:-$DEFAULT_ADMIN_USERNAME}"
 ADMIN_PASSWORD="${4:-$DEFAULT_ADMIN_PASSWORD}"
 
 INSTALL_DIR="/opt/splunkforwarder"
 
-# If CCDC gives you a Nextcloud/HTTP drop for UF, put it here:
-# Example: INTERNAL_BASE_URL="http://172.20.241.10/team01/splunk/uf/10.0.1/"
+# If CCDC gives you Nextcloud/HTTP for UF, put it here. This will be tried first.
+# Example: INTERNAL_BASE_URL="http://172.20.241.10/team01/splunk/uf/9.1.10/"
 INTERNAL_BASE_URL=""
 
-SPLUNK_VERSION="9.1.1"
-SPLUNK_BUILD="c486717c322b"
-SPLUNK_TGZ_NAME="splunkforwarder-${SPLUNK_VERSION}-${SPLUNK_BUILD}-linux-amd64.tgz"
-SPLUNK_PUBLIC_URL="https://download.splunk.com/products/universalforwarder/releases/${SPLUNK_VERSION}/linux/${SPLUNK_TGZ_NAME}"
+# ---------- SPLUNK UF 9.1.10 (your links) ----------
+# Windows MSI
+WIN_MSI_NAME="splunkforwarder-9.1.10-a6ea9b30f817-x64-release.msi"
+WIN_MSI_URL="https://download.splunk.com/products/universalforwarder/releases/9.1.10/windows/${WIN_MSI_NAME}"
+
+# Linux DEB (Ubuntu/Debian)
+LIN_DEB_NAME="splunkforwarder-9.1.10-a6ea9b30f817-linux-2.6-amd64.deb"
+LIN_DEB_URL="https://download.splunk.com/products/universalforwarder/releases/9.1.10/linux/${LIN_DEB_NAME}"
+
+# Linux RPM (Oracle/RHEL/CentOS/Fedora)
+LIN_RPM_NAME="splunkforwarder-9.1.10-a6ea9b30f817.x86_64.rpm"
+LIN_RPM_URL="https://download.splunk.com/products/universalforwarder/releases/9.1.10/linux/${LIN_RPM_NAME}"
+
+# Linux TGZ (fallback)
+LIN_TGZ_NAME="splunkforwarder-9.1.10-a6ea9b30f817-Linux-x86_64.tgz"
+LIN_TGZ_URL="https://download.splunk.com/products/universalforwarder/releases/9.1.10/linux/${LIN_TGZ_NAME}"
 
 # ---------- COLORS ----------
 RED=$'\e[0;31m'; GREEN=$'\e[0;32m'; YELLOW=$'\e[0;33m'; BLUE=$'\e[0;34m'; CYAN=$'\e[0;36m'; NC=$'\e[0m'
@@ -75,74 +88,32 @@ create_splunk_user() {
   fi
 }
 
-download_uf_tgz() {
-  local target="$SPLUNK_TGZ_NAME"
-  local max_retries=3
-  local i=0
+# ----- LINUX DOWNLOAD HELPERS -----
+download_linux_deb() {
+  local target="$LIN_DEB_NAME"
   if [ -n "$INTERNAL_BASE_URL" ]; then
-    local int_url="${INTERNAL_BASE_URL}${SPLUNK_TGZ_NAME}"
-    echo "${BLUE}Trying internal UF URL: $int_url${NC}"
-    if wget -O "$target" "$int_url"; then
-      echo "${GREEN}Downloaded from internal source.${NC}"
-      return 0
-    else
-      echo "${YELLOW}Internal source failed, trying public.${NC}"
-    fi
+    wget -O "$target" "${INTERNAL_BASE_URL}${LIN_DEB_NAME}" && return 0
   fi
-  while [ $i -lt $max_retries ]; do
-    if [ $i -eq 0 ]; then
-      wget -O "$target" "$SPLUNK_PUBLIC_URL" && return 0
-    else
-      wget --no-check-certificate -O "$target" "$SPLUNK_PUBLIC_URL" && return 0
-    fi
-    i=$((i+1))
-    echo "${RED}Download failed ($i/$max_retries).${NC}"
-    sleep 4
-  done
-  return 1
+  wget -O "$target" "$LIN_DEB_URL"
 }
 
-install_splunk_tgz() {
-  echo "${BLUE}Installing Splunk UF to ${INSTALL_DIR}...${NC}"
-  sudo mkdir -p /opt
-  sudo tar -xvzf "$SPLUNK_TGZ_NAME" -C /opt
-  create_splunk_user
-  sudo chown -R splunk:splunk "$INSTALL_DIR"
-}
-
-seed_admin() {
-  local seed="$INSTALL_DIR/etc/system/local/user-seed.conf"
-  sudo mkdir -p "$(dirname "$seed")"
-  sudo bash -c "cat > '$seed'" <<EOF
-[user_info]
-USERNAME = $ADMIN_USERNAME
-PASSWORD = $ADMIN_PASSWORD
-EOF
-  sudo chown splunk:splunk "$seed"
-}
-
-enable_and_start() {
-  sudo "$INSTALL_DIR/bin/splunk" start --accept-license --answer-yes --no-prompt
-  sudo "$INSTALL_DIR/bin/splunk" enable boot-start
-  if systemctl list-unit-files | grep -qi splunkforwarder; then
-    sudo systemctl enable --now SplunkForwarder 2>/dev/null || true
+download_linux_rpm() {
+  local target="$LIN_RPM_NAME"
+  if [ -n "$INTERNAL_BASE_URL" ]; then
+    wget -O "$target" "${INTERNAL_BASE_URL}${LIN_RPM_NAME}" && return 0
   fi
+  wget -O "$target" "$LIN_RPM_URL"
 }
 
-configure_forwarding_and_monitors() {
-  # hard rule: 9997 unless packet says otherwise
-  local dest="${INDEXER_IP}:${PACKET_INDEXER_PORT}"
-  echo "${BLUE}Pointing forwarder at ${dest} (packet rule).${NC}"
-  sudo "$INSTALL_DIR/bin/splunk" add forward-server "$dest" -auth "${ADMIN_USERNAME}:${ADMIN_PASSWORD}"
-  # common linux logs; missing files are OK
-  sudo "$INSTALL_DIR/bin/splunk" add monitor /var/log/syslog 2>/dev/null || true
-  sudo "$INSTALL_DIR/bin/splunk" add monitor /var/log/auth.log 2>/dev/null || true
-  sudo "$INSTALL_DIR/bin/splunk" add monitor /var/log/secure 2>/dev/null || true
-  sudo "$INSTALL_DIR/bin/splunk" add monitor /var/log/messages 2>/dev/null || true
-  sudo "$INSTALL_DIR/bin/splunk" list forward-server
-  sudo "$INSTALL_DIR/bin/splunk" restart
+download_linux_tgz() {
+  local target="$LIN_TGZ_NAME"
+  if [ -n "$INTERNAL_BASE_URL" ]; then
+    wget -O "$target" "${INTERNAL_BASE_URL}${LIN_TGZ_NAME}" && return 0
+  fi
+  wget -O "$target" "$LIN_TGZ_URL"
 }
 
+# ----- LINUX INSTALL -----
 linux_full_auto() {
   if [ "$EUID" -ne 0 ]; then
     echo "${RED}Run as root/sudo.${NC}"
@@ -153,65 +124,110 @@ linux_full_auto() {
     echo "${YELLOW}UF already installed at $INSTALL_DIR. Exiting.${NC}"
     exit 0
   fi
-  if ! download_uf_tgz; then
-    echo "${RED}Could not download UF from internal or public. Stop.${NC}"
-    exit 1
+
+  # detect family
+  local use_deb=0
+  if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    case "$ID" in
+      ubuntu|debian) use_deb=1 ;;
+      *) use_deb=0 ;;
+    esac
   fi
-  install_splunk_tgz
-  seed_admin
-  enable_and_start
-  configure_forwarding_and_monitors
+
+  if [ $use_deb -eq 1 ]; then
+    echo "${BLUE}Debian/Ubuntu detected. Fetching DEB...${NC}"
+    if ! download_linux_deb; then
+      echo "${RED}DEB download failed. Trying TGZ...${NC}"
+      download_linux_tgz || { echo "${RED}All downloads failed.${NC}"; exit 1; }
+      sudo mkdir -p /opt
+      sudo tar -xvzf "$LIN_TGZ_NAME" -C /opt
+    else
+      sudo dpkg -i "$LIN_DEB_NAME" || sudo apt -f install -y
+    fi
+  else
+    echo "${BLUE}RPM-based detected. Fetching RPM...${NC}"
+    if ! download_linux_rpm; then
+      echo "${RED}RPM download failed. Trying TGZ...${NC}"
+      download_linux_tgz || { echo "${RED}All downloads failed.${NC}"; exit 1; }
+      sudo mkdir -p /opt
+      sudo tar -xvzf "$LIN_TGZ_NAME" -C /opt
+    else
+      sudo rpm -i "$LIN_RPM_NAME"
+    fi
+  fi
+
+  create_splunk_user
+  sudo chown -R splunk:splunk "$INSTALL_DIR"
+
+  # seed admin
+  local seed="$INSTALL_DIR/etc/system/local/user-seed.conf"
+  sudo mkdir -p "$(dirname "$seed")"
+  sudo bash -c "cat > '$seed'" <<EOF
+[user_info]
+USERNAME = $ADMIN_USERNAME
+PASSWORD = $ADMIN_PASSWORD
+EOF
+  sudo chown splunk:splunk "$seed"
+
+  # start and enable
+  sudo "$INSTALL_DIR/bin/splunk" start --accept-license --answer-yes --no-prompt
+  sudo "$INSTALL_DIR/bin/splunk" enable boot-start
+  if systemctl list-unit-files | grep -qi splunkforwarder; then
+    sudo systemctl enable --now SplunkForwarder 2>/dev/null || true
+  fi
+
+  # forward and monitors (packet: 9997)
+  local dest="${INDEXER_IP}:${PACKET_INDEXER_PORT}"
+  echo "${BLUE}Pointing forwarder at ${dest}${NC}"
+  sudo "$INSTALL_DIR/bin/splunk" add forward-server "$dest" -auth "${ADMIN_USERNAME}:${ADMIN_PASSWORD}"
+
+  # common linux logs (some will 404, ok)
+  sudo "$INSTALL_DIR/bin/splunk" add monitor /var/log/syslog 2>/dev/null || true
+  sudo "$INSTALL_DIR/bin/splunk" add monitor /var/log/auth.log 2>/dev/null || true
+  sudo "$INSTALL_DIR/bin/splunk" add monitor /var/log/secure 2>/dev/null || true
+  sudo "$INSTALL_DIR/bin/splunk" add monitor /var/log/messages 2>/dev/null || true
+
+  sudo "$INSTALL_DIR/bin/splunk" list forward-server
+  sudo "$INSTALL_DIR/bin/splunk" restart
+
   echo "CCDC UF test $(date)" | sudo tee /tmp/test.log >/dev/null
   sudo setfacl -m u:splunk:r /tmp/test.log 2>/dev/null || true
-  echo "${GREEN}Linux UF install complete and pointed at ${INDEXER_IP}:${PACKET_INDEXER_PORT}.${NC}"
+  echo "${GREEN}Linux UF install complete and pointed at ${dest}.${NC}"
 }
 
+# ----- WINDOWS SECTION -----
 print_windows_instructions() {
-  echo_msg "Windows UF install (packet is authoritative, port 9997)"
-  cat <<'EOW'
-# Run in elevated PowerShell on the Windows VM
-# Use the MSI from your CCDC Nextcloud/share. Do NOT pull random internet MSI during the event.
-$msi = "splunkforwarder-10.0.1-x64.msi"     # adjust to actual filename from share
-$idx = "172.20.241.20:9997"
-Start-Process msiexec.exe -ArgumentList "/i `"$msi`" AGREETOLICENSE=Yes /qn" -Wait
-& "C:\Program Files\SplunkUniversalForwarder\bin\splunk.exe" start --accept-license --answer-yes
-& "C:\Program Files\SplunkUniversalForwarder\bin\splunk.exe" add forward-server $idx
-& "C:\Program Files\SplunkUniversalForwarder\bin\splunk.exe" add monitor C:\Windows\System32\winevt\Logs\Security.evtx
-& "C:\Program Files\SplunkUniversalForwarder\bin\splunk.exe" list forward-server
+  echo_msg "Windows UF (9.1.10) – run this in elevated PowerShell on the Windows VM"
+  cat <<EOW
+# Download UF 9.1.10 MSI from Splunk
+wget -O ${WIN_MSI_NAME} "${WIN_MSI_URL}"
+
+# Install silently, accept license
+Start-Process msiexec.exe -ArgumentList "/i `"$PWD\\${WIN_MSI_NAME}`" AGREETOLICENSE=Yes /qn" -Wait
+
+# Point to packet indexer 172.20.241.20:9997
+& "C:\\Program Files\\SplunkUniversalForwarder\\bin\\splunk.exe" start --accept-license --answer-yes
+& "C:\\Program Files\\SplunkUniversalForwarder\\bin\\splunk.exe" add forward-server ${PACKET_INDEXER_IP}:${PACKET_INDEXER_PORT}
+& "C:\\Program Files\\SplunkUniversalForwarder\\bin\\splunk.exe" add monitor C:\\Windows\\System32\\winevt\\Logs\\Security.evtx
+& "C:\\Program Files\\SplunkUniversalForwarder\\bin\\splunk.exe" list forward-server
 EOW
 }
 
+# ----- MENU (packet machines only) -----
 main_menu() {
   echo -e "${BLUE}_________________________________________________________${NC}"
-  echo -e "${BLUE}Splunk UF install – CCDC 2025${NC}"
+  echo -e "${BLUE}Splunk UF install – CCDC 2025 (packet machines)${NC}"
   echo ""
-  echo -e "  1. ${CYAN}Windows (print PS instructions)${NC}"
-  echo -e "  2. ${CYAN}Linux (auto install, point to packet IP, port 9997)${NC}"
-  echo -e "  3. ${CYAN}Mac (manual)${NC}"
-  echo -e "  4. ${CYAN}FreeBSD (manual)${NC}"
+  echo -e "  1. ${CYAN}Windows (print PS/wget for 9.1.10)${NC}"
+  echo -e "  2. ${CYAN}Linux (auto detect deb/rpm; point to 172.20.241.20:9997)${NC}"
   echo ""
-  read -n1 -p "  Enter choice (1-4): " choice
+  read -n1 -p "  Enter choice (1-2): " choice
   echo ""
   case "$choice" in
     1) print_windows_instructions ;;
     2) linux_full_auto ;;
-    3)
-      echo_msg "Mac UF quick steps (packet rule: 9997)"
-      echo "1) Get mac UF from CCDC share."
-      echo "2) sudo /opt/splunkforwarder/bin/splunk start --accept-license"
-      echo "3) sudo /opt/splunkforwarder/bin/splunk enable boot-start"
-      echo "4) sudo /opt/splunkforwarder/bin/splunk add forward-server ${PACKET_INDEXER_IP}:${PACKET_INDEXER_PORT}"
-      echo "5) sudo /opt/splunkforwarder/bin/splunk add monitor /var/log/system.log"
-      ;;
-    4)
-      echo_msg "FreeBSD UF quick steps (packet rule: 9997)"
-      echo "1) pkg add splunkforwarder.txz (from share)"
-      echo "2) /opt/splunkforwarder/bin/splunk start --accept-license"
-      echo "3) /opt/splunkforwarder/bin/splunk add forward-server ${PACKET_INDEXER_IP}:${PACKET_INDEXER_PORT}"
-      echo "4) /opt/splunkforwarder/bin/splunk add monitor /var/log/auth.log"
-      ;;
-    *)
-      echo "${RED}Invalid.${NC}"; exit 1 ;;
+    *) echo "${RED}Invalid.${NC}"; exit 1 ;;
   esac
 }
 
