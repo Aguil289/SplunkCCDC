@@ -5,7 +5,7 @@ Run as Administrator.
 #>
 
 param(
-  [string]$Indexer = "172.20.241.20",
+  [string]$Indexer = "172.20.242.20",
   [int]$Port = 9997,
   [string]$Username = "admin",
   [string]$Password = "Changeme123!",
