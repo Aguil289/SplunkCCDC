@@ -1,0 +1,123 @@
+<#
+ccdc-uf.ps1
+MWCCDC 2025 - Windows Splunk Universal Forwarder installer (9.1.10)
+Run as Administrator.
+#>
+
+param(
+  [string]$Indexer = "172.20.241.20",
+  [int]$Port = 9997,
+  [string]$Username = "admin",
+  [string]$Password = "Changeme123!",
+  [string]$MsiUrl = "https://download.splunk.com/products/universalforwarder/releases/9.1.10/windows/splunkforwarder-9.1.10-a6ea9b30f817-x64-release.msi",
+  [string]$MsiLocal = "",            # optional path to a pre-downloaded MSI
+  [switch]$ForceReset                # if present, remove existing creds and seed new admin
+)
+
+# -- helpers
+function Abort($msg){ Write-Host $msg -ForegroundColor Red; exit 1 }
+
+# require admin
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+  Abort "Script must be run as Administrator."
+}
+
+$ErrorActionPreference = 'Stop'
+
+$ufPath = "C:\Program Files\SplunkUniversalForwarder"
+$splunkExe = Join-Path $ufPath "bin\splunk.exe"
+$msiTarget = if ($MsiLocal -ne "") { (Resolve-Path $MsiLocal).Path } else { Join-Path $env:TEMP ([IO.Path]::GetFileName($MsiUrl)) }
+$idxTarget = "$Indexer`:$Port"
+
+Write-Host "Indexer target:" $idxTarget -ForegroundColor Cyan
+Write-Host "MSI target:" $msiTarget -ForegroundColor Cyan
+
+# download MSI if needed
+if (-not (Test-Path $msiTarget)) {
+  if ($MsiLocal -ne "") {
+    Abort "Provided MSI path not found: $MsiLocal"
+  }
+  Write-Host "Downloading MSI..." -ForegroundColor Cyan
+  Invoke-WebRequest -Uri $MsiUrl -OutFile $msiTarget -UseBasicParsing
+}
+
+# If Splunk already installed, note it
+$installed = Test-Path $splunkExe
+if ($installed) {
+  Write-Host "Splunk UF appears installed at $ufPath" -ForegroundColor Yellow
+  # If force reset, stop, remove passwd and proceed to reseed
+  if ($ForceReset) {
+    Write-Host "Force reset requested. Stopping service and resetting credentials..." -ForegroundColor Yellow
+    & $splunkExe stop 2>$null
+    Start-Sleep -Seconds 2
+    Remove-Item -Path (Join-Path $ufPath "etc\passwd") -ErrorAction SilentlyContinue
+    $seedContent = @"
+[user_info]
+USERNAME = $Username
+PASSWORD = $Password
+"@
+    $seedPath = Join-Path $ufPath "etc\system\local\user-seed.conf"
+    $seedContent | Out-File -FilePath $seedPath -Encoding ASCII
+    Write-Host "Wrote user-seed.conf to $seedPath" -ForegroundColor Green
+  }
+} else {
+  # Install MSI silently
+  Write-Host "Installing Splunk UF MSI..." -ForegroundColor Cyan
+  $msiEscaped = $msiTarget -replace '"','`"'
+  $args = "/i `"$msiEscaped`" AGREETOLICENSE=Yes /qn"
+  $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -Passthru
+  if ($proc.ExitCode -ne 0) { Abort "msiexec failed with exit code $($proc.ExitCode)." }
+  Write-Host "Installation complete." -ForegroundColor Green
+}
+
+# confirm splunk exe exists now
+if (-not (Test-Path $splunkExe)) { Abort "splunk.exe not found at $splunkExe" }
+
+# stop before config changes
+Write-Host "Stopping splunkd (if running)..." -ForegroundColor Cyan
+& $splunkExe stop 2>$null | Out-Null
+Start-Sleep -Seconds 2
+
+# seed admin if user-seed.conf exists or ForceReset used or passwd missing
+$seedPath = Join-Path $ufPath "etc\system\local\user-seed.conf"
+$passwdPath = Join-Path $ufPath "etc\passwd"
+if (($ForceReset) -or (-not (Test-Path $passwdPath)) -or (Test-Path $seedPath)) {
+  Write-Host "Seeding admin credentials..." -ForegroundColor Cyan
+  $seedContent = @"
+[user_info]
+USERNAME = $Username
+PASSWORD = $Password
+"@
+  $seedContent | Out-File -FilePath $seedPath -Encoding ASCII
+  Write-Host "Seed file written to $seedPath" -ForegroundColor Green
+}
+
+# start splunk, accept license
+Write-Host "Starting Splunk Forwarder..." -ForegroundColor Cyan
+& $splunkExe start --accept-license --answer-yes 2>$null
+Start-Sleep -Seconds 3
+
+# enable boot start
+Write-Host "Enabling boot-start..." -ForegroundColor Cyan
+& $splunkExe enable boot-start 2>$null
+
+# ensure service exists under systemd equivalent (Windows service)
+# (Splunk installer creates service; ignore errors)
+Try { Start-Sleep -Seconds 1 } Catch {}
+
+# Add forward-server (use explicit -auth if necessary)
+Write-Host "Adding forward-server $idxTarget ..." -ForegroundColor Cyan
+# If password is seeded this will not prompt. Use -auth to be explicit.
+& $splunkExe add forward-server $idxTarget -auth "$Username`:$Password" 2>$null
+
+# Add event log monitors
+Write-Host "Adding Windows event log monitors..." -ForegroundColor Cyan
+& $splunkExe add monitor "C:\Windows\System32\winevt\Logs\Security.evtx" -auth "$Username`:$Password" 2>$null
+& $splunkExe add monitor "C:\Windows\System32\winevt\Logs\System.evtx" -auth "$Username`:$Password" 2>$null
+& $splunkExe add monitor "C:\Windows\System32\winevt\Logs\Application.evtx" -auth "$Username`:$Password" 2>$null
+
+# Show configured forward-servers
+Write-Host "`nConfigured forward-servers:" -ForegroundColor Cyan
+& $splunkExe list forward-server -auth "$Username`:$Password"
+
+Write-Host "`nDone. Verify on indexer that data arrives or run 'Get-Content' on the UF logs." -ForegroundColor Green
