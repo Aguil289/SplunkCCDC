@@ -173,12 +173,12 @@ EOF
 }
 
 cleanup_user_seed() {
-  # After first successful start, you generally don't need this anymore
-  if [[ -f "$SPLUNK_HOME/etc/passwd" ]] && grep -q '^admin:' "$SPLUNK_HOME/etc/passwd"; then
-  rm -f "$LOCAL_CONF/user-seed.conf"
-fi
-
+  cleanup_user_seed() {
+  if [[ -f "$SPLUNK_HOME/etc/passwd" ]] && grep -q "^${ADMIN_USER}:" "$SPLUNK_HOME/etc/passwd"; then
+    rm -f "$LOCAL_CONF/user-seed.conf"
+  fi
 }
+
 
 ###################### INSTALLATION ######################
 ensure_uf_installed() {
@@ -307,12 +307,13 @@ chmod 600 "$LOCAL_CONF/server.conf"
   fi
 
 
-  cat > "$LOCAL_CONF/outputs.conf" <<EOF
+cat > "$LOCAL_CONF/outputs.conf" <<EOF
 [tcpout]
 defaultGroup = primary
 
 [tcpout:primary]
 server = ${INDEXER}:9997
+EOF
 
 
   chown "$SPLUNK_USER:$SPLUNK_USER" "$LOCAL_CONF/outputs.conf" 2>/dev/null || true
@@ -352,6 +353,7 @@ index = ${index}
 
 EOF
       SUCCESSFUL_MONITORS+=("$path")
+      fi
   }
 
   # Start fresh
