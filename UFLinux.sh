@@ -571,6 +571,7 @@ install_flow() {
 }
 
 configure_flow() {
+  ensure_splunk_user
   configure_forwarding
   restart_uf
   enable_boot_start
@@ -578,6 +579,7 @@ configure_flow() {
 }
 
 monitors_flow() {
+  ensure_splunk_user
   add_log_monitors
   restart_uf
   verify_forwarding
