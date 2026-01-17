@@ -1,7 +1,6 @@
 <#
 CCDC Splunk Universal Forwarder (Windows) installer/config
 - Downloads UF MSI (BITS first, fallback to Invoke-WebRequest)
-- Installs UF silently
 - Configures outputs.conf, server.conf, inputs.conf
 - Monitors key Windows Event Logs (+ optional Sysmon/IIS/Firewall logs if present)
 - Emits test events
@@ -32,10 +31,37 @@ $SplunkExe  = Join-Path $SplunkHome "bin\splunk.exe"
 $WorkDir    = "C:\CCDC\SplunkUF"
 $LogDir     = "C:\CCDC\logs"
 $LogFile    = Join-Path $LogDir "ccdc-uf-install.log"
+$MsiName = ""
+$MsiUrl  = ""
 
-# UF version
-$MsiName = "splunkforwarder-9.2.11-45e7d4c09780-x64-release.msi "
-$MsiUrl  = "https://download.splunk.com/products/universalforwarder/releases/9.2.11/windows/splunkforwarder-9.2.11-45e7d4c09780-x64-release.msi"
+
+
+# ---------- UF download selection ----------
+function Select-UFPackage {
+  Write-Host ""
+  Write-Host "Select Windows OS / target:"
+  Write-Host "1) Windows Server 2016 (use UF 9.2.11 x64)"
+  Write-Host "2) Windows Server 2019/2022 (use UF 10.2.0 x64)"
+  Write-Host "3) Windows 10/11 (use UF 10.2.0 x64)"
+  $choice = Read-Host "Choice [1-3]"
+
+  switch ($choice) {
+    "1" {
+      $script:MsiName = "splunkforwarder-9.2.11-45e7d4c09780-x64-release.msi"
+      $script:MsiUrl  = "https://download.splunk.com/products/universalforwarder/releases/9.2.11/windows/$($script:MsiName)"
+    }
+    "2" { goto Default10 }
+    "3" { goto Default10 }
+    default { goto Default10 }
+  }
+
+  return
+
+  :Default10
+  $script:MsiName = "splunkforwarder-10.2.0-d749cb17ea65-windows-x64.msi"
+  $script:MsiUrl  = "https://download.splunk.com/products/universalforwarder/releases/10.2.0/windows/$($script:MsiName)"
+}
+
 
 # ---------- Helpers ----------
 function Ensure-Dir([string]$Path) {
@@ -232,6 +258,7 @@ function Emit-TestEvents {
 
 # ---------- Main ----------
 Require-Admin
+Select-UFPackage
 Assert-OSCompatibility
 
 Ensure-Dir $WorkDir
