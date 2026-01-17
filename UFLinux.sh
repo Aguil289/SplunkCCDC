@@ -129,6 +129,16 @@ ensure_splunk_user() {
       setfacl -dm u:$SPLUNK_USER:rx "$dir" 2>/dev/null || true
     fi
   done
+
+  # Also set ACLs on the actual log files we monitor (files do NOT inherit from dir ACL reliably)
+  for f in /var/log/messages /var/log/secure /var/log/syslog /var/log/auth.log /var/log/audit/audit.log; do
+    if [[ -f "$f" ]]; then
+      setfacl -m u:${SPLUNK_USER}:r "$f" 2>/dev/null || true
+    fi
+  done
+
+  # Optional: default ACL so newly created files under /var/log inherit traverse perms
+  setfacl -d -m u:${SPLUNK_USER}:rx /var/log 2>/dev/null || true
   
   echo "[OK] ACL permissions set"
 }
