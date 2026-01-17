@@ -50,18 +50,23 @@ function Select-UFPackage {
       $script:MsiName = "splunkforwarder-9.2.11-45e7d4c09780-x64-release.msi"
       $script:MsiUrl  = "https://download.splunk.com/products/universalforwarder/releases/9.2.11/windows/$($script:MsiName)"
     }
-    "2" { goto Default10 }
-    "3" { goto Default10 }
-    default { goto Default10 }
+    "2" {
+      $script:MsiName = "splunkforwarder-10.2.0-d749cb17ea65-windows-x64.msi"
+      $script:MsiUrl  = "https://download.splunk.com/products/universalforwarder/releases/10.2.0/windows/$($script:MsiName)"
+    }
+    "3" {
+      $script:MsiName = "splunkforwarder-10.2.0-d749cb17ea65-windows-x64.msi"
+      $script:MsiUrl  = "https://download.splunk.com/products/universalforwarder/releases/10.2.0/windows/$($script:MsiName)"
+    }
+    default {
+      Write-Host "[WARN] Invalid choice; defaulting to UF 10.2.0"
+      $script:MsiName = "splunkforwarder-10.2.0-d749cb17ea65-windows-x64.msi"
+      $script:MsiUrl  = "https://download.splunk.com/products/universalforwarder/releases/10.2.0/windows/$($script:MsiName)"
+    }
   }
 
-  return
-
-  :Default10
-  $script:MsiName = "splunkforwarder-10.2.0-d749cb17ea65-windows-x64.msi"
-  $script:MsiUrl  = "https://download.splunk.com/products/universalforwarder/releases/10.2.0/windows/$($script:MsiName)"
+  Write-Host "[INFO] Selected MSI: $script:MsiName"
 }
-
 
 # ---------- Helpers ----------
 function Ensure-Dir([string]$Path) {
