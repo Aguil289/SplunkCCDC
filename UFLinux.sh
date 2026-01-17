@@ -174,7 +174,10 @@ EOF
 
 cleanup_user_seed() {
   # After first successful start, you generally don't need this anymore
-  rm -f "$LOCAL_CONF/user-seed.conf" 2>/dev/null || true
+  if [[ -f "$SPLUNK_HOME/etc/passwd" ]] && grep -q '^admin:' "$SPLUNK_HOME/etc/passwd"; then
+  rm -f "$LOCAL_CONF/user-seed.conf"
+fi
+
 }
 
 ###################### INSTALLATION ######################
@@ -262,6 +265,15 @@ enable_boot_start() {
 ###################### CONFIGURATION ######################
 configure_forwarding() {
   ensure_uf_installed
+  mkdir -p "$LOCAL_CONF"
+  umask 077
+  cat > "$LOCAL_CONF/server.conf" <<EOF
+[general]
+serverName = $(hostname -s)-splunkfwd
+EOF
+chown "$SPLUNK_USER:$SPLUNK_USER" "$LOCAL_CONF/server.conf" || true
+chmod 600 "$LOCAL_CONF/server.conf"
+
 
   # Fast deploy mode: use provided indexer IP
   if [[ "$FAST_DEPLOY" == true ]]; then
@@ -294,8 +306,7 @@ configure_forwarding() {
     fi
   fi
 
-  mkdir -p "$LOCAL_CONF"
-  umask 077
+
   cat > "$LOCAL_CONF/outputs.conf" <<EOF
 [tcpout]
 defaultGroup = primary
@@ -303,10 +314,6 @@ defaultGroup = primary
 [tcpout:primary]
 server = ${INDEXER}:9997
 
-# Set a stable client name for easier tracking
-[general]
-serverName = $(hostname -s)-splunkfwd
-EOF
 
   chown "$SPLUNK_USER:$SPLUNK_USER" "$LOCAL_CONF/outputs.conf" 2>/dev/null || true
   chmod 600 "$LOCAL_CONF/outputs.conf"
