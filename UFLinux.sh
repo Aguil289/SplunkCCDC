@@ -173,11 +173,11 @@ EOF
 }
 
 cleanup_user_seed() {
-  cleanup_user_seed() {
   if [[ -f "$SPLUNK_HOME/etc/passwd" ]] && grep -q "^${ADMIN_USER}:" "$SPLUNK_HOME/etc/passwd"; then
     rm -f "$LOCAL_CONF/user-seed.conf"
   fi
 }
+
 
 
 ###################### INSTALLATION ######################
@@ -353,7 +353,7 @@ index = ${index}
 
 EOF
       SUCCESSFUL_MONITORS+=("$path")
-      fi
+    fi
   }
 
   # Start fresh
