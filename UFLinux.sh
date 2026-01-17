@@ -352,7 +352,6 @@ index = ${index}
 
 EOF
       SUCCESSFUL_MONITORS+=("$path")
-    fi
   }
 
   # Start fresh
