@@ -500,12 +500,12 @@ configure_splunk() {
   cat > "${SPLUNK_HOME}/etc/system/local/server.conf" <<EOF
 [sslConfig]
 enableSplunkdSSL = true
-sslVersions = tls1.2, tls1.3
+sslVersions = tls1.2
 cipherSuite = TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256
 allowSslCompression = false
 
 [general]
-mgmtHostPort = 127.0.0.1:${SPLUNK_MGMT_PORT}
+mgmtHostPort = 127.0.0.1:8089
 EOF
 
   cat > "${SPLUNK_HOME}/etc/system/local/web.conf" <<EOF
