@@ -66,7 +66,6 @@ echo "--- CREDENTIAL SETUP ---"
 echo "Changing System Passwords..."
 
 prompt_password "Root" ROOT_PASS
-prompt_password "Bbob (backup admin)" BBOB_PASS
 prompt_password "Splunk Admin (web UI)" SPLUNK_PASSWORD
 
 # Change root password
@@ -82,14 +81,6 @@ else
     echo "[!] sysadmin user does not exist, skipping"
 fi
 
-# Create Backup User 'bbob'
-if ! id "bbob" &>/dev/null; then
-    echo "Creating backup user bbob..."
-    useradd bbob
-    usermod -aG wheel bbob
-fi
-echo "bbob:$BBOB_PASS" | chpasswd
-echo "[+] Configured bbob with sudo access"
 
 echo "------------------------"
 
