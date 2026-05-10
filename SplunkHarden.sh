@@ -235,10 +235,6 @@ echo "Clearing Cron jobs..."
 echo "" > /etc/crontab
 rm -f /var/spool/cron/* 2>/dev/null || true
 
-echo "Removing SSH Server..."
-systemctl stop sshd 2>/dev/null || true
-systemctl disable sshd 2>/dev/null || true
-dnf remove -y openssh-server 2>/dev/null || true
 
 echo "Restricting user creation tools..."
 chmod 700 /usr/sbin/useradd 2>/dev/null || true
@@ -253,15 +249,6 @@ echo "root" > /etc/at.allow
 chmod 600 /etc/at.allow
 awk -F: '{print $1}' /etc/passwd | grep -v root > /etc/at.deny
 
-# --- FIREWALL ---
-echo ""
-echo "==================================================="
-echo "              Firewall Configuration               "
-echo "==================================================="
-
-dnf install -y iptables-services 2>/dev/null || true
-systemctl stop firewalld 2>/dev/null || true
-systemctl disable firewalld 2>/dev/null || true
 
 
 # --- CLEANUP ---
