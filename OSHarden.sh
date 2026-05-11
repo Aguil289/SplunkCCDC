@@ -257,7 +257,6 @@ check_malicious_bash() {
       grep -nE "^[^#]*(trap|PROMPT_COMMAND|curl\s|wget\s|nc\s|/dev/tcp|/dev/udp|bash\s+-i)" "$FILE" \
         >> "$malicious_log" 2>/dev/null || true
 
-      # 🚨 GUARD: NEVER auto-edit system-wide shell init files
       case "$FILE" in
         /etc/bashrc|/etc/profile|/etc/profile.d/*)
           warn "Suspicious patterns detected in system file $FILE — logged ONLY, not modified"
